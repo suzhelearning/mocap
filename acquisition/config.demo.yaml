@@ -1,0 +1,48 @@
+# acquisition 运行时配置 — 加载与校验见 src/acquisition/config.py
+# 使用前需按真机情况修改:刚体 ID、手腕 offset、轴变换
+
+router:
+  endpoint: "tcp/127.0.0.1:7447"   # Ubuntu 本机 zenohd(常驻 Router)
+
+# Motive 中定义的刚体(Motive Y-up 右手系、米制)
+rigid_bodies:
+  back: 1                          # 背部 markers 刚体 ID(与 Motive 工程一致)
+  objects:                         # 物体刚体 ID → 名字(采集时各物体单独建刚体)
+    cup: 2
+    tray: 3
+
+hands:
+  left:
+    back_rigid_id: 1
+    wrist_offset:                  # 背部刚体身体系下的手腕偏移(需真机标定)
+      mode: body                   # body=随背部刚体旋转(推荐);world=固定世界方向
+      xyz: [0.15, -0.30, -0.05]    # 身体系:右肩方向、上、背方向(典型值)
+      # yaw_deg: 0                 # 可选:手腕相对背部刚体的固定姿态修正
+      # pitch_deg: 0
+      # roll_deg: 0
+    # wrist_rigid_id: 8            # 可选:若 Motive 直接追踪手腕刚体,用其位姿跳过 offset
+  right:
+    back_rigid_id: 1
+    wrist_offset:
+      mode: body
+      xyz: [-0.15, -0.30, -0.05]   # 左肩方向、上、背方向
+
+axis_transform:                    # Manus 骨架(z-up) → Motive 系(y-up) 轴变换
+  permutation: [0, 2, 1]           # 输出 = (输入[0], 输入[2], 输入[1])
+  signs: [1, 1, -1]                # A·d = (d_x, d_z, -d_y) = 绕 X -90°
+  # 标定:开 live_view 看手指方向;上/下颠倒改 signs,左/右颠倒改 permutation
+
+recording:
+  output_dir: "captures"
+  store_markers: true              # true=存原始 markers(vlen);false=只存刚体+手腕+手部
+  chunk_frames: 4096               # HDF5 resize 批大小
+
+keys:
+  start: r                         # 空闲 → 开始录制
+  pause: " "                       # 录制 ↔ 暂停
+  save: s                          # 停止并保存
+  discard: d                       # 停止并丢弃
+  quit: q                          # 退出(录制中先丢弃当前 take)
+
+viz:
+  port: 8081                       # 避开 mocap viewer 8080 / manus viz 8090

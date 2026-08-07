@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mocap-viewer"
+version = "0.1.0"
+description = "Real-time Zenoh NatNet marker-frame visualization with Viser"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "viser>=1.0.30,<2",
+  "numpy>=1.26,<3",
+]
+
+[project.scripts]
+mocap-viewer = "mocap_viewer.main:main"
+
+[tool.setuptools.packages.find]
+include = ["mocap_viewer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

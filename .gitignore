@@ -1,0 +1,13 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Python cache
+__pycache__/
+*.egg-info/
+
+# compiled artifacts
+rawviz.out
+
+# nested independent repo (hosted at suzhelearning/natnet)
+natnet/

@@ -1,0 +1,31 @@
+[workspace]
+channels = ["conda-forge"]
+name = "acquisition"
+platforms = ["linux-64"]
+version = "0.1.0"
+description = "人类操作演示数据采集:动捕手腕位姿 + Manus 手部骨架拼接、web 可视化、按键录制 HDF5"
+
+[tasks]
+record = "python -m acquisition.cli"
+record-noviz = "python -m acquisition.cli --no-viz"
+demo-manus = "python scripts/demo_manus_pub.py"
+demo-mocap = "pixi run --manifest-path ../pixi.toml demo-publish"
+inspect = "python scripts/inspect_hdf5.py"
+replay = "python scripts/replay_hdf5.py"
+test = "pytest"
+start-router = "bash scripts/start_zenohd.sh"
+
+[dependencies]
+python = "3.12.*"            # natnet-zenoh 要求 >=3.12,<3.13,不能复用 manus 的 3.14
+numpy = ">=1.26,<3"
+h5py = ">=3.11,<4"
+pyyaml = ">=6,<7"
+viser = ">=1.0.30,<2"
+pytest = ">=8,<9"
+
+[pypi-dependencies]
+eclipse-zenoh = ">=1.9,<1.10"
+natnet-zenoh = { path = "../natnet", editable = true }
+
+[activation]
+env = { PYTHONPATH = "src" }

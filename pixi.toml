@@ -1,0 +1,21 @@
+[workspace]
+channels = ["conda-forge"]
+name = "mocap"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+view = "mocap-viewer"
+view-open = "mocap-viewer --open"
+subscribe = "python scripts/zenoh_consumer.py"
+demo-publish = "python scripts/demo_publisher.py"
+test = "pytest src/mocap_viewer/tests -q"
+
+[dependencies]
+python = "3.12.*"
+pytest = ">=8,<9"
+
+[pypi-dependencies]
+eclipse-zenoh = ">=1.9, <1.10"
+natnet-zenoh = { path = "natnet", editable = true }
+mocap-viewer = { path = "src/mocap_viewer", editable = true }
