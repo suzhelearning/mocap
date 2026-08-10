@@ -3,8 +3,8 @@
 设计:
 - append_* 只入内存缓冲(在 zenoh 回调/主线程调用,开销极小)
 - flush() 把缓冲批量写入 HDF5(在录制主循环周期性调用,避开回调线程)
-- 写入临时文件 .take_{id}_tmp.h5;保存 = flush + os.replace 原子改名;
-  丢弃 = close + unlink(不留任何数据)
+- 临时文件写入 output_dir/.tmp_<pid>/ 私有 0700 目录(随机名,防符号链接/预测攻击);
+  保存 = flush + os.replace 原子改名;丢弃 = close + unlink(不留任何数据)
 
 时间基准:全部用 t_ubuntu_ns(接收端墙钟)。mocap 帧自带 t_ubuntu_ns
 (StreamHub 打点);manus 帧同样。
@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -24,6 +26,7 @@ import h5py
 import numpy as np
 
 from .config import Config
+from .rate import RateGate
 
 H5_VERSION = "1.0"
 
@@ -42,10 +45,13 @@ _KIND_INDEX = {"active": 0, "asset_member": 1, "point_cloud": 2, "unknown": 3}
 class TakeWriter:
     """流式 HDF5 录制器;begin → append* → finalize_save | discard。"""
 
-    def __init__(self, path: Path, config: Config) -> None:
+    def __init__(self, path: Path, config: Config,
+                 rate_gate: RateGate | None = None) -> None:
         self._path = path
-        self._tmp_path = path.with_name(f".{path.stem}_tmp.h5")
+        self._tmp_path: Path | None = None      # 创建于私有 0700 目录,随机名
+        self._tmp_dir: Path | None = None
         self._cfg = config
+        self._rate_gate = rate_gate
         self._f: h5py.File | None = None
         self._lock = threading.Lock()
 
@@ -61,11 +67,22 @@ class TakeWriter:
     # -- 生命周期 ---------------------------------------------------------
 
     def begin(self, take_id: int, start_wall_ns: int) -> None:
-        """创建临时文件并写静态 attrs。"""
+        """创建临时文件并写静态 attrs。
+
+        临时文件放在 output_dir 下的私有 0700 目录(本进程独占),文件名随机
+        (mkstemp):防符号链接/预测性临时文件攻击——共享写权限目录下攻击者
+        无法预建符号链接,也无法写入 0700 私有目录。
+        """
         if self._f is not None:
             raise RuntimeError("TakeWriter 已 begin")
         self._start_ns = start_wall_ns
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._tmp_dir = self._path.parent / f".tmp_{os.getpid()}"
+        self._tmp_dir.mkdir(mode=0o700, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{self._path.stem}_", suffix=".tmp.h5", dir=self._tmp_dir)
+        os.close(fd)
+        self._tmp_path = Path(tmp_name)
         self._f = h5py.File(self._tmp_path, "w")
         f = self._f
         f.attrs["h5_version"] = H5_VERSION
@@ -141,9 +158,11 @@ class TakeWriter:
     # -- 数据追加(轻量,只入缓冲) -------------------------------------------
 
     def append_mocap(self, frame: dict) -> None:
-        """frame 须带 t_ubuntu_ns(StreamHub 已打点)。"""
+        """frame 须带 t_ubuntu_ns(StreamHub 已打点);按目标频率门控落盘。"""
+        if self._rate_gate is not None and not self._rate_gate.should_write(stream="mocap"):
+            return
         with self._lock:
-            if self._f is not None:
+            if self._f is not None and not self._ended:
                 self._mocap.append(frame)
                 self._counts["mocap"] += 1
 
@@ -155,8 +174,11 @@ class TakeWriter:
         wrist_quat_xyzw: np.ndarray,
         nodes_global: np.ndarray,
     ) -> None:
+        # 每路流独立 RateGate 窗口:三路流不共享节拍,各自达到目标频率
+        if self._rate_gate is not None and not self._rate_gate.should_write(stream=side):
+            return
         with self._lock:
-            if self._f is not None:
+            if self._f is not None and not self._ended:
                 self._manus[side].append((msg, wrist_pos, wrist_quat_xyzw, nodes_global))
                 self._counts[side] += 1
 
@@ -203,22 +225,23 @@ class TakeWriter:
     def finalize_save(self) -> None:
         """flush + 写收尾 attrs + 原子改名为正式文件名。
 
-        注意:必须先 flush(此时 _ended 仍为 False)再标记 ended,
-        否则 flush 会因 ended 跳过导致数据丢失。
+        顺序:先在锁内置 _ended=True 封口(新 append 不再入缓冲),再 flush
+        写完全部缓冲,最后取 f 写 attrs 并置 None。若先 flush 再封口,
+        flush 换空缓冲之后、置 None 之前入队的帧会静默丢失。
         """
         with self._lock:
             if self._f is None or self._ended:
                 return
+            self._ended = True
         self.flush()
         with self._lock:
             if self._f is None:
                 return
-            f = self._f
-            self._ended = True
-            self._f = None
+            f, self._f = self._f, None
             f.attrs["end_wall_ns"] = time.time_ns()
         f.close()
         os.replace(self._tmp_path, self._path)
+        self._cleanup_tmp_dir()
 
     def discard(self) -> None:
         """关闭并删除临时文件(不留数据)。"""
@@ -227,7 +250,15 @@ class TakeWriter:
             self._ended = True
         if f is not None:
             f.close()
-        self._tmp_path.unlink(missing_ok=True)
+        if self._tmp_path is not None:
+            self._tmp_path.unlink(missing_ok=True)
+        self._cleanup_tmp_dir()
+
+    def _cleanup_tmp_dir(self) -> None:
+        """删除私有临时目录;非空(不应发生)则忽略。"""
+        if self._tmp_dir is not None:
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            self._tmp_dir = None
 
     @property
     def tmp_path(self) -> Path:
@@ -322,8 +353,11 @@ class TakeWriter:
         g["nodes_global"].resize(g["nodes_global"].shape[0] + n, axis=0)
         base = g["t_ubuntu_ns"].shape[0] - n
         for k, (msg, wrist_pos, wrist_quat, nodes_global) in enumerate(buf):
+            seq = msg.get("seq")
+            if seq is None:          # 二进制模式等无 seq 来源时用 -1
+                seq = -1
             g["t_ubuntu_ns"][base + k] = msg["t_ubuntu_ns"]
-            g["seq"][base + k] = msg.get("seq", -1)
+            g["seq"][base + k] = seq
             g["nodes_raw"][base + k] = msg["nodes"]
             g["wrist_position"][base + k] = wrist_pos
             g["wrist_quaternion_xyzw"][base + k] = wrist_quat

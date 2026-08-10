@@ -1,12 +1,12 @@
 """拼接可视化(StitchedScene):Viser web 展示全局双手 + 物体动作。
 
-渲染内容:
-- 背部刚体:绿色 Frame(tracking_valid=false 时红色)
-- 物体刚体:每个物体一个紫色 Frame + 名字标签
-- 左右手腕:红/蓝小 Frame(offset 推算结果)
-- 双手骨架:点云(25 节点,chain 配色)+ 骨骼线段 —— 全局拼接坐标
-- 原始 markers:灰色小点云(默认开,可用 --no-markers 关闭)
-- 状态栏:顶部文字
+UI 风格参考 NatNetViewerSource/src/natnet_zenoh/viewer.py:
+- dark 主题(collapsible 布局、品牌色、无 logo/分享按钮)
+- Markdown 状态栏
+- 可折叠 folder:「录制控制」「视图」「桌面」
+- Marker 按跟踪状态配色(id_kind/occluded 红)
+- y-up 场景 + 桌面道具(操作物体场景参考)
+- 保留采集特有元素:双手骨架(chain 配色)、手腕/物体刚体、录制按钮/采集频率
 
 手骨架配色常量复制自 manus/viz.py(manus 不是包,不可 import),来源已注明。
 Frame 的姿态要求 wxyz 序,与协议 xyzw 互转。
@@ -14,11 +14,17 @@ Frame 的姿态要求 wxyz 序,与协议 xyzw 互转。
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+
 import numpy as np
 import viser
 
 from .config import Config
 from .kinematics import quat_xyzw_to_wxyz
+from .state_machine import State
+
+FREQ_OPTIONS = ("30", "60", "100", "120")
 
 # 手指链配色(复制自 manus/viz.py)5=拇指 6=食指 7=中指 8=无名指 9=小指 13=手掌
 CHAIN_COLORS = {
@@ -31,10 +37,63 @@ CHAIN_COLORS = {
 }
 DEFAULT_COLOR = (160, 160, 160)
 
+# Marker 按跟踪状态配色(参考 NatNetViewerSource/viewer.py)
+MARKER_COLORS = {
+    "active": (45, 212, 191),
+    "asset_member": (74, 222, 128),
+    "point_cloud": (251, 146, 60),
+    "unknown": (148, 163, 184),
+}
+OCCLUDED_COLOR = (239, 68, 68)
+
 WRIST_COLORS = {"left": (214, 39, 40), "right": (31, 119, 180)}
 BACK_COLOR = (44, 160, 44)
 OBJECT_COLOR = (148, 103, 189)
-MARKER_COLOR = (170, 170, 170)
+
+# MANO/MediaPipe 21 点配色(按手指,与 CHAIN_COLORS 一致):
+# 0=wrist 灰, 1-4=拇指 橙, 5-8=食指 青, 9-12=中指 黄,
+# 13-16=无名指 橙红, 17-20=小指 蓝
+MANO_PALETTE = np.asarray([
+    (210, 210, 210),
+    (244, 162, 97), (244, 162, 97), (244, 162, 97), (244, 162, 97),
+    (42, 157, 143), (42, 157, 143), (42, 157, 143), (42, 157, 143),
+    (233, 196, 106), (233, 196, 106), (233, 196, 106), (233, 196, 106),
+    (231, 111, 81), (231, 111, 81), (231, 111, 81), (231, 111, 81),
+    (69, 123, 157), (69, 123, 157), (69, 123, 157), (69, 123, 157),
+], dtype=np.uint8)
+
+
+@dataclass(frozen=True)
+class TableSpec:
+    """桌面区域几何(Motive 世界系,米制):y=0 平面上的矩形框,无高度信息。"""
+
+    width: float = 1.440
+    depth: float = 0.900
+    center_x: float = 0.0
+    center_z: float = 0.0
+
+    def frame_segments(self) -> np.ndarray:
+        """桌面区域矩形框四条边(y=0 平面)。"""
+        x0 = self.center_x - self.width / 2.0
+        x1 = self.center_x + self.width / 2.0
+        z0 = self.center_z - self.depth / 2.0
+        z1 = self.center_z + self.depth / 2.0
+        return np.asarray(
+            [
+                [[x0, 0.0, z0], [x1, 0.0, z0]],
+                [[x1, 0.0, z0], [x1, 0.0, z1]],
+                [[x1, 0.0, z1], [x0, 0.0, z1]],
+                [[x0, 0.0, z1], [x0, 0.0, z0]],
+            ],
+            dtype=np.float32,
+        )
+
+
+def marker_color(marker: dict) -> tuple[int, int, int]:
+    """按跟踪状态返回稳定显示色。"""
+    if bool(marker.get("occluded")) or bool(marker.get("model_filled")):
+        return OCCLUDED_COLOR
+    return MARKER_COLORS.get(str(marker.get("id_kind")), MARKER_COLORS["unknown"])
 
 
 class _HandMesh:
@@ -51,6 +110,9 @@ class _HandMesh:
             points=np.zeros((node_count, 3)),
             colors=self.node_color,
             point_size=0.006,
+            point_shape="circle",
+            precision="float32",
+            point_shading="gradient",
         )
         self.ls = server.scene.add_line_segments(
             f"{path}/bones", points=np.zeros((0, 2, 3)),
@@ -88,39 +150,278 @@ class _HandMesh:
 class StitchedScene:
     """拼接可视化场景;update() 应在主循环以 ~30fps 调用。"""
 
-    def __init__(self, config: Config, host: str = "0.0.0.0", port: int | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+        on_command: Callable[[str], None] | None = None,
+        on_freq: Callable[[float], None] | None = None,
+        on_object: Callable[[str], None] | None = None,
+    ) -> None:
+        """on_command: 录制按钮点击回调(发 keymap 字符,线程安全队列)。
+        on_freq: 采集频率下拉变更回调(线程安全 RateGate.set_hz)。
+        on_object: 操作物体下拉变更回调(线程安全,仅存变量)。
+        都在 viser 回调线程执行,实现须线程安全。
+        """
         self._cfg = config
         self._port = port or config.viz_port
+        self._on_command = on_command or (lambda ch: None)
+        self._on_freq = on_freq or (lambda hz: None)
+        self._on_object = on_object or (lambda name: None)
+        self._last_state: State | None = None
         self.server = viser.ViserServer(host=host, port=self._port)
-        self.server.scene.add_grid("/grid", width=2.0, cell_size=0.1)
-        self.status = self.server.gui.add_text("/status", "waiting for data...")
+
+        # -- 主题与场景(参考 NatNetViewerSource/viewer.py) -------------------
+        self.server.gui.configure_theme(
+            control_layout="collapsible",
+            control_width="medium",
+            dark_mode=True,
+            show_logo=False,
+            show_share_button=False,
+            brand_color=(16, 185, 129),
+        )
+        self.server.scene.set_up_direction((0.0, 1.0, 0.0))   # Motive y-up
+        # 世界坐标轴(原点)会落在桌面中心遮挡手部:隐藏,坐标轴改由
+        # _render_table 绘制在桌面区域左下角边缘
+        self.server.scene.world_axes.visible = False
+        self.server.initial_camera.position = (2.2, 1.7, 2.2)
+        self.server.initial_camera.look_at = (0.0, 1.0, 0.0)
+        self.server.initial_camera.up_direction = (0.0, 1.0, 0.0)
+        self.grid = self.server.scene.add_grid(
+            "/ground", width=6.0, height=6.0, plane="xz",
+            cell_size=0.1, section_size=1.0,
+            cell_color=(71, 85, 105), section_color=(148, 163, 184),
+            plane_opacity=0.04,
+        )
+        self.status = self.server.gui.add_text(
+            "状态", initial_value="○ 空闲", disabled=True, order=1)
+        self.status_rate_mocap = self.server.gui.add_text(
+            "动捕", initial_value="动捕 0.0Hz", disabled=True, order=2)
+        self.status_rate_left = self.server.gui.add_text(
+            "左手", initial_value="左手 0.0Hz", disabled=True, order=3)
+        self.status_rate_right = self.server.gui.add_text(
+            "右手", initial_value="右手 0.0Hz", disabled=True, order=4)
+        self._build_controls()
 
         self._back = self.server.scene.add_frame("/rigid/back", wxyz=(1, 0, 0, 0),
-                                                 position=(0, 0, 0), axes_length=0.15)
+                                                 position=(0, 0, 0),
+                                                 axes_length=0.03, axes_radius=0.002)
         self._objects = {
             name: self.server.scene.add_frame(f"/rigid/object/{name}",
                                               wxyz=(1, 0, 0, 0), position=(0, 0, 0),
-                                              axes_length=0.08)
+                                              axes_length=0.025, axes_radius=0.002)
             for name in config.objects
         }
         self._object_labels = {
-            name: self.server.scene.add_label(f"/label/object/{name}", name, position=(0, 0, 0))
+            name: self.server.scene.add_label(f"/label/object/{name}", name, position=(0, 0, 0),
+                                              anchor="bottom-center", font_screen_scale=0.8)
             for name in config.objects
         }
         self._wrists = {
             side: self.server.scene.add_frame(f"/wrist/{side}", wxyz=(1, 0, 0, 0),
-                                              position=(0, 0, 0), axes_length=0.07)
+                                              position=(0, 0, 0),
+                                              axes_length=0.025, axes_radius=0.002)
             for side in ("left", "right")
         }
         self._hands = {
             side: _HandMesh(self.server, f"/hand/{side}")
             for side in ("left", "right")
         }
+        # 默认只显示 MANO 21 点;25 点原始骨架默认隐藏(由开关开启)
+        self._show_hands = False
+        for mesh in self._hands.values():
+            mesh.pc.visible = False
+            mesh.ls.visible = False
+        # MANO/MediaPipe 21 关键点(每侧一点云,按手指分色,默认显示)
+        self._mano_pc = {
+            side: self.server.scene.add_point_cloud(
+                f"/mano/{side}", points=np.zeros((0, 3)),
+                colors=np.zeros((0, 3), dtype=np.uint8),
+                point_size=0.010, point_shape="circle", precision="float32",
+                point_shading="gradient", visible=False,
+            )
+            for side in ("left", "right")
+        }
+        self._show_mano = True
         self._marker_pc = self.server.scene.add_point_cloud(
             "/markers", points=np.zeros((0, 3)), colors=np.zeros((0, 3), dtype=np.uint8),
-            point_size=0.004,
+            point_size=0.012, point_shape="circle", precision="float32",
+            point_shading="gradient",
         )
         self._show_markers = True
+        self._table_handles: list[object] = []
+        self._render_table()
+
+    # -- GUI ---------------------------------------------------------------
+
+    def _build_controls(self) -> None:
+        """三个可折叠 folder:录制控制 / 视图 / 桌面。
+
+        回调均为 async def(viser 事件循环执行),体内只做线程安全的
+        转发(on_command → 主循环命令队列,on_freq → RateGate 锁内赋值)。
+        """
+        keymap = self._cfg.keymap
+        # 布局:录制控制(0) → 状态 items(1-6) → 视图(10) → 桌面(11)
+        with self.server.gui.add_folder("录制控制", order=0):
+            self._btn_start = self.server.gui.add_button(
+                "开始录制", color=(44, 160, 44), hint=f"键盘键 {keymap['start']!r}")
+            self._btn_save = self.server.gui.add_button(
+                "保存", color=(31, 119, 180), hint=f"键盘键 {keymap['save']!r}")
+            self._btn_discard = self.server.gui.add_button(
+                "丢弃", color=(214, 39, 40), hint=f"键盘键 {keymap['discard']!r}")
+            default_freq = str(int(self._cfg.sample_hz))
+            if default_freq not in FREQ_OPTIONS:
+                default_freq = "100"
+            self._freq = self.server.gui.add_dropdown(
+                "采集频率 (Hz)", FREQ_OPTIONS, initial_value=default_freq,
+                hint="录制落盘目标频率(输入流 120Hz 时下采样)")
+            # 操作物体选择(默认 cylinder,config.objects 中不存在则取第一个)
+            obj_options = list(self._cfg.objects.keys())
+            default_obj = "cylinder" if "cylinder" in obj_options else (
+                obj_options[0] if obj_options else "")
+            self._object_select = self.server.gui.add_dropdown(
+                "操作物体", obj_options or [""],
+                initial_value=default_obj or (obj_options[0] if obj_options else ""),
+                hint="当前操作物体(选中项随录制记录,后期扩展)")
+
+        with self.server.gui.add_folder("视图", order=10):
+            self._marker_size = self.server.gui.add_slider(
+                "标记点大小", min=0.002, max=0.05, step=0.001, initial_value=0.012)
+            self._show_markers_cb = self.server.gui.add_checkbox(
+                "原始标记点", initial_value=True)
+            self._show_mano_cb = self.server.gui.add_checkbox(
+                "MANO 21 点", initial_value=True)
+            self._show_hands_cb = self.server.gui.add_checkbox(
+                "25 点骨架", initial_value=False)
+            self._show_grid_cb = self.server.gui.add_checkbox("地面网格", initial_value=True)
+            self._show_rigid_cb = self.server.gui.add_checkbox("刚体坐标轴", initial_value=True)
+            self._reset_view = self.server.gui.add_button("重置视角")
+
+        with self.server.gui.add_folder("桌面", order=11):
+            self._show_table = self.server.gui.add_checkbox("显示桌面区域", initial_value=True)
+            self._table_width_mm = self.server.gui.add_number(
+                "宽 (mm)", initial_value=1440, min=1, step=1)
+            self._table_depth_mm = self.server.gui.add_number(
+                "深 (mm)", initial_value=900, min=1, step=1)
+            self._table_center_x_mm = self.server.gui.add_number(
+                "中心 X (mm)", initial_value=0, step=1)
+            self._table_center_z_mm = self.server.gui.add_number(
+                "中心 Z (mm)", initial_value=0, step=1)
+
+        # -- 回调 ------------------------------------------------------------
+        @self._btn_start.on_click
+        async def _on_start(_e):
+            self._on_command(keymap["start"])
+
+        @self._btn_save.on_click
+        async def _on_save(_e):
+            self._on_command(keymap["save"])
+
+        @self._btn_discard.on_click
+        async def _on_discard(_e):
+            self._on_command(keymap["discard"])
+
+        self._freq.on_update(lambda _e: self._on_freq(float(self._freq.value)))
+        self._object_select.on_update(
+            lambda _e: self._on_object(str(self._object_select.value)))
+        self._marker_size.on_update(lambda _e: self._apply_marker_style())
+        self._show_markers_cb.on_update(lambda _e: setattr(self, "_show_markers",
+                                                           self._show_markers_cb.value))
+        self._show_mano_cb.on_update(lambda _e: setattr(self, "_show_mano",
+                                                        self._show_mano_cb.value))
+        self._show_hands_cb.on_update(lambda _e: self._apply_hand_visibility())
+        self._show_grid_cb.on_update(lambda _e: setattr(self.grid, "visible",
+                                                        self._show_grid_cb.value))
+        self._show_rigid_cb.on_update(self._update_rigid_visibility)
+        self._reset_view.on_click(self._reset_cameras)
+        self._show_table.on_update(self._update_table_visibility)
+        for control in (self._table_width_mm, self._table_depth_mm,
+                        self._table_center_x_mm, self._table_center_z_mm):
+            control.on_update(lambda _e: self._render_table())
+
+        self.update_state(State.IDLE)     # 初始按钮态
+
+    def update_state(self, state: State | None) -> None:
+        """按状态机状态控制按钮可用性;仅状态变化时推送(避免高频重复消息)。"""
+        if state is None or state is self._last_state:
+            return
+        self._last_state = state
+        idle = state is State.IDLE
+        recording = state is State.RECORDING
+        self._btn_start.disabled = not idle
+        self._btn_save.disabled = not recording
+        self._btn_discard.disabled = not recording
+
+    # -- 视图/桌面控制 -------------------------------------------------------
+
+    def _apply_marker_style(self) -> None:
+        self._marker_pc.point_size = self._marker_size.value
+
+    def _apply_hand_visibility(self) -> None:
+        """25 点骨架开关:立即生效(数据到达时 update 也会应用)。"""
+        self._show_hands = self._show_hands_cb.value
+        for mesh in self._hands.values():
+            mesh.pc.visible = self._show_hands
+            mesh.ls.visible = self._show_hands
+
+    def _update_rigid_visibility(self, _event: object = None) -> None:
+        visible = self._show_rigid_cb.value
+        self._back.visible = visible
+        for frame in self._objects.values():
+            frame.visible = visible
+        for frame in self._wrists.values():
+            frame.visible = visible
+
+    def _reset_cameras(self, _event: object = None) -> None:
+        for client in self.server.get_clients().values():
+            client.camera.position = (2.2, 1.7, 2.2)
+            client.camera.look_at = (0.0, 1.0, 0.0)
+            client.camera.up_direction = (0.0, 1.0, 0.0)
+
+    def _table_spec(self) -> TableSpec:
+        return TableSpec(
+            width=float(self._table_width_mm.value) / 1000.0,
+            depth=float(self._table_depth_mm.value) / 1000.0,
+            center_x=float(self._table_center_x_mm.value) / 1000.0,
+            center_z=float(self._table_center_z_mm.value) / 1000.0,
+        )
+
+    def _render_table(self) -> None:
+        """重建桌面区域道具(矩形线框 + 尺寸标签 + 边缘坐标轴;无高度/实体)。"""
+        for handle in self._table_handles:
+            handle.remove()
+        spec = self._table_spec()
+        visible = self._show_table.value
+        self._table_handles = [
+            self.server.scene.add_line_segments(
+                "/table/frame",
+                points=spec.frame_segments(),
+                colors=(16, 185, 129),
+                line_width=3.0,
+                visible=visible,
+            ),
+            self.server.scene.add_label(
+                "/table/size",
+                text=f"{int(self._table_width_mm.value)} × {int(self._table_depth_mm.value)} mm",
+                position=(spec.center_x, 0.0, spec.center_z - spec.depth / 2.0 - 0.02),
+                anchor="bottom-center",
+                font_screen_scale=0.8,
+                visible=visible,
+            ),
+            # 方向参考坐标轴:位于桌面区域左下角外侧(不遮挡手部)
+            self.server.scene.add_frame(
+                "/table/axes", wxyz=(1, 0, 0, 0),
+                position=(spec.center_x - spec.width / 2.0 - 0.05, 0.0,
+                          spec.center_z - spec.depth / 2.0 - 0.05),
+                axes_length=0.08, axes_radius=0.003,
+                visible=visible,
+            ),
+        ]
+
+    def _update_table_visibility(self, _event: object = None) -> None:
+        for handle in self._table_handles:
+            handle.visible = self._show_table.value
 
     # -- 更新 -------------------------------------------------------------
 
@@ -129,7 +430,9 @@ class StitchedScene:
         mocap_frame: dict | None,
         hands: dict[str, dict],
         edges: dict[str, list[tuple[int, int, int]]],
-        status_text: str = "",
+        latest_mano: dict[str, dict | None] | None = None,
+        status: dict[str, str] | None = None,
+        state: State | None = None,
     ) -> None:
         """刷新全部场景元素。
 
@@ -138,19 +441,24 @@ class StitchedScene:
                        "wrist_quat_xyzw": (4,)}} 或 None
         edges: {side: [(child, parent, chain)]} 或 None
         """
-        # 背部刚体
-        back_pos = np.zeros(3)
-        back_wxyz = (1.0, 0, 0, 0)
-        if mocap_frame is not None:
-            for rb in mocap_frame.get("rigid_bodies", []):
-                if rb.get("id") == self._cfg.back_rigid_id:
-                    back_pos = rb["position"]
-                    back_wxyz = quat_xyzw_to_wxyz(rb["quaternion_xyzw"])
-                    valid = bool(rb.get("tracking_valid", True))
-                    self._back.color = BACK_COLOR if valid else (255, 60, 60)
-                    break
-        self._back.position = back_pos
-        self._back.wxyz = back_wxyz
+        rigid_visible = self._show_rigid_cb.value
+
+        # 背部刚体(无 back 配置时隐藏,如 Motive 直接追踪手腕的模式)
+        if self._cfg.back_rigid_id is None:
+            self._back.visible = False
+        elif rigid_visible:
+            back_pos = np.zeros(3)
+            back_wxyz = (1.0, 0, 0, 0)
+            if mocap_frame is not None:
+                for rb in mocap_frame.get("rigid_bodies", []):
+                    if rb.get("id") == self._cfg.back_rigid_id:
+                        back_pos = np.asarray(rb["position"], dtype=float)
+                        back_wxyz = quat_xyzw_to_wxyz(rb["quaternion_xyzw"])
+                        valid = bool(rb.get("tracking_valid", True))
+                        self._back.color = BACK_COLOR if valid else (255, 60, 60)
+                        break
+            self._back.position = back_pos
+            self._back.wxyz = back_wxyz
 
         # 物体刚体
         if mocap_frame is not None:
@@ -162,9 +470,10 @@ class StitchedScene:
                         break
                 frame = self._objects[name]
                 if obj is not None:
-                    frame.position = obj["position"]
+                    frame.position = np.asarray(obj["position"], dtype=float)
                     frame.wxyz = quat_xyzw_to_wxyz(obj["quaternion_xyzw"])
-                    frame.visible = True
+                    frame.visible = rigid_visible
+                    self._object_labels[name].visible = rigid_visible
                     self._object_labels[name].position = (
                         np.asarray(obj["position"], dtype=float) + np.array([0.0, 0.06, 0.0])
                     )
@@ -178,28 +487,48 @@ class StitchedScene:
             if h is None:
                 self._wrists[side].visible = False
                 continue
-            self._wrists[side].visible = True
+            self._wrists[side].visible = rigid_visible
             self._wrists[side].position = h["wrist_pos"]
             self._wrists[side].wxyz = quat_xyzw_to_wxyz(h["wrist_quat_xyzw"])
             mesh = self._hands[side]
             mesh.set_edges(edges.get(side) or [])
             mesh.update(h["nodes_global"])
+            mesh.pc.visible = self._show_hands
+            mesh.ls.visible = self._show_hands
 
-        # 原始 markers
+            # MANO/MediaPipe 21 关键点(分色点云)
+            mano = (latest_mano or {}).get(side)
+            pc = self._mano_pc[side]
+            if self._show_mano and mano is not None and mano.get("keypoints_global") is not None:
+                pc.points = np.asarray(mano["keypoints_global"], dtype=float)
+                pc.colors = MANO_PALETTE
+                pc.visible = True
+            else:
+                pc.points = np.zeros((0, 3))
+                pc.visible = False
+
+        # 原始 markers(按跟踪状态配色)
         if self._show_markers and mocap_frame is not None:
             markers = mocap_frame.get("markers", [])
             pts = np.asarray([m["position"] for m in markers], dtype=float)
+            colors = np.asarray([marker_color(m) for m in markers], dtype=np.uint8)
             self._marker_pc.points = pts
-            self._marker_pc.colors = np.full(pts.shape, MARKER_COLOR, dtype=np.uint8)
+            self._marker_pc.colors = colors
         else:
             self._marker_pc.points = np.zeros((0, 3))
 
-        # 状态栏
-        if status_text:
-            self.status.text = status_text
+        # 录制按钮状态
+        self.update_state(state)
+
+        # 状态栏(独立 item,各自更新,避免整块重排跳变)
+        if status:
+            self.status.value = status.get("ctrl", "")
+            self.status_rate_mocap.value = status.get("rate_mocap", "")
+            self.status_rate_left.value = status.get("rate_left", "")
+            self.status_rate_right.value = status.get("rate_right", "")
 
     def stop(self) -> None:
         try:
-            self.server._close()
+            self.server.stop()
         except Exception:
             pass

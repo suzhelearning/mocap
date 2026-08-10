@@ -12,6 +12,23 @@ import h5py
 import numpy as np
 
 
+def reject_external_links(f: h5py.File, prefix: str = "") -> None:
+    """递归检查并拒绝含外部/软链接的 HDF5(不解析链接,仅查类型)。
+
+    防恶意 .h5 经 HDF5 外部链接把本机任意文件内容读进检查进程。
+    """
+    for name in f:
+        link = f.get(name, getlink=True)
+        if not isinstance(link, h5py.HardLink):
+            raise ValueError(
+                f"拒绝含 {type(link).__name__} 的 HDF5: {prefix}{name}"
+                + (f" -> {link.filename}" if isinstance(link, h5py.ExternalLink) else "")
+            )
+        obj = f[name]
+        if isinstance(obj, h5py.Group):
+            reject_external_links(obj, f"{prefix}{name}/")
+
+
 def _timing(ds: h5py.Dataset, label: str) -> None:
     t = ds[:].astype(np.float64)
     if t.size < 2:
@@ -31,6 +48,11 @@ def main() -> int:
         return 2
     path = sys.argv[1]
     with h5py.File(path, "r") as f:
+        try:
+            reject_external_links(f)
+        except ValueError as exc:
+            print(f"[拒绝] {exc}", file=sys.stderr)
+            return 1
         print(f"== {path} ==")
         for key in ("take_id", "start_wall_ns", "end_wall_ns"):
             print(f"  attr {key}: {f.attrs.get(key)}")

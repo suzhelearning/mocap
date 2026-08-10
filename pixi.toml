@@ -8,7 +8,6 @@ version = "0.1.0"
 view = "mocap-viewer"
 view-open = "mocap-viewer --open"
 subscribe = "python scripts/zenoh_consumer.py"
-demo-publish = "python scripts/demo_publisher.py"
 test = "pytest src/mocap_viewer/tests -q"
 
 [dependencies]

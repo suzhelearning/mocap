@@ -21,6 +21,14 @@ Motive → NatNet → Zenoh 数据链路中两台主机的网络信息。
 ssh -i ~/.ssh/id_ed25519_windows -l 'current robotics' 192.168.110.6
 ```
 
+⚠ 私钥安全要求:
+- 私钥权限必须为 `600`(OpenSSH 会拒绝 group/world 可读的私钥,脚本依赖它连 Windows):
+  `chmod 600 ~/.ssh/id_ed25519_windows`
+- 首次连接时确认并记录 Windows 主机 host key(`ssh-keyscan 192.168.110.6`),
+  之后如 host key 变更,ssh 会报 MITM 告警——不要盲目 `-o StrictHostKeyChecking=no`
+- 该密钥可免密执行 Windows 侧命令(`windows_pub.sh` 依赖),等同 Windows 管理员凭据,
+  请勿复制到不可信机器
+
 ## Zenoh 数据通道（有线）
 
 - Ubuntu subscriber 监听：`tcp/0.0.0.0:7447`（所有接口）

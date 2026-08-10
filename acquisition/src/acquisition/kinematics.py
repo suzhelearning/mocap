@@ -79,6 +79,24 @@ def euler_wxyz(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
     ])
 
 
+def quat_slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+    """四元数球面插值(wxyz 序),t ∈ [0,1]。
+
+    退化(近似平行)回退线性插值并归一化;输入无需预归一化。
+    """
+    q0 = np.asarray(q0, dtype=float) / np.linalg.norm(q0)
+    q1 = np.asarray(q1, dtype=float) / np.linalg.norm(q1)
+    dot = float(np.dot(q0, q1))
+    if dot < 0:
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        result = q0 + t * (q1 - q0)
+        return result / np.linalg.norm(result)
+    theta = np.arccos(np.clip(dot, -1, 1))
+    return (np.sin((1 - t) * theta) * q0 + np.sin(t * theta) * q1) / np.sin(theta)
+
+
 def compose_axis(permutation: Sequence[int], signs: Sequence[float]) -> np.ndarray:
     """由 permutation + signs 构造轴变换矩阵 A:(A·d)_j = signs[j]·d[permutation[j]]。
 

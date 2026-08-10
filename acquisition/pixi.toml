@@ -8,8 +8,6 @@ description = "人类操作演示数据采集:动捕手腕位姿 + Manus 手部�
 [tasks]
 record = "python -m acquisition.cli"
 record-noviz = "python -m acquisition.cli --no-viz"
-demo-manus = "python scripts/demo_manus_pub.py"
-demo-mocap = "pixi run --manifest-path ../pixi.toml demo-publish"
 inspect = "python scripts/inspect_hdf5.py"
 replay = "python scripts/replay_hdf5.py"
 test = "pytest"

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""e2e_check.py — 端到端验证:真实/合成流 → 按键录制 → HDF5 检查。
+"""e2e_check.py — 端到端验证:真实流 → 按键录制 → HDF5 检查。
 
 流程(通过 pty 模拟按键):r 开始录制 → 等 REC seconds → s 保存 → q 退出,
 然后检查 captures/ 下生成的 HDF5 并跑 inspect。
 
-前置:zenohd 已在 7447 监听;有动捕流(真实或 demo-mocap)与 manus 流
-(真实或 demo-manus)发布到 router。
+前置:zenohd 已在 7447 监听;有真实动捕流(Motive/Windows publisher)
+与 manus 流(Manus 手套发布)发布到 router(合成 demo 数据已移除)。
 
-用法: pixi run python scripts/e2e_check.py [--config config.demo.yaml] [--seconds 5]
+用法: pixi run python scripts/e2e_check.py [--seconds 5]
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="config.demo.yaml")
+    ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--seconds", type=float, default=5.0)
     ap.add_argument("--no-viz", action="store_true", default=True)
     args = ap.parse_args()
@@ -86,12 +86,18 @@ def main() -> int:
         print("[FAIL] record 未成功连接 router", file=sys.stderr)
         return 1
 
-    h5s = sorted((ROOT / "captures").glob("take_*.h5"))
+# 输出目录来自配置(output_dir/<日期>/*.h5),非写死 captures/
+    try:
+        from acquisition.config import load_config
+        cfg_dir = load_config(ROOT / "config.yaml").output_dir
+    except Exception:
+        cfg_dir = ROOT / "captures"
+    h5s = sorted(cfg_dir.rglob("*.h5"))
     if not h5s:
         print("[FAIL] 未生成 HDF5 文件", file=sys.stderr)
         return 1
     h5 = h5s[-1]
-    print(f"[e2e] 生成: {h5.relative_to(ROOT)}")
+    print(f"[e2e] 生成: {h5}")
 
     # inspect 输出校验
     result = subprocess.run(

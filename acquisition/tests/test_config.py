@@ -29,7 +29,6 @@ recording:
   store_markers: true
 keys:
   start: r
-  pause: " "
   save: s
   discard: d
   quit: q
@@ -123,5 +122,85 @@ hands:
     cfg = _load(minimal)
     assert cfg.hands["left"].wrist_offset.mode == "body"
     assert cfg.axis_permutation == (0, 2, 1)
-    assert cfg.keymap == {"start": "r", "pause": " ", "save": "s",
+    assert cfg.keymap == {"start": "r", "save": "s",
                           "discard": "d", "quit": "q"}
+
+
+def test_no_back_with_all_wrist_rigid_ids():
+    """Motive 直接追踪双手腕(无背部刚体):back 可省略,wrist_rigid_id 全配。"""
+    cfg_text = """
+router:
+  endpoint: "tcp/127.0.0.1:7447"
+rigid_bodies:
+  objects:
+    cylinder: 3
+hands:
+  left:
+    wrist_rigid_id: 2
+  right:
+    wrist_rigid_id: 1
+"""
+    cfg = _load(cfg_text)
+    assert cfg.back_rigid_id is None
+    assert cfg.objects == {"cylinder": 3}
+    assert cfg.hands["left"].back_rigid_id is None
+    assert cfg.hands["left"].wrist_rigid_id == 2
+    assert cfg.hands["right"].wrist_rigid_id == 1
+
+
+def test_no_back_requires_wrist_rigid_id():
+    """无背部刚体时,任一 hand 缺 wrist_rigid_id 必须报错。"""
+    bad = """
+router:
+  endpoint: "tcp/127.0.0.1:7447"
+rigid_bodies:
+  objects: {}
+hands:
+  left:
+    wrist_rigid_id: 2
+  right: {}
+"""
+    with pytest.raises(ConfigError, match="wrist_rigid_id"):
+        _load(bad)
+
+
+def test_back_rigid_id_may_reference_any_rigid():
+    """hands.back_rigid_id 允许引用任意 Motive 刚体 ID(如手套背面 marker 刚体),
+    不要求出现在 rigid_bodies.back/objects 中。"""
+    cfg_text = """
+router:
+  endpoint: "tcp/127.0.0.1:7447"
+rigid_bodies:
+  back: 1
+  objects:
+    cylinder: 3
+hands:
+  left:
+    back_rigid_id: 2              # 未在 back/objects 声明,但合法(手部基准刚体)
+    wrist_offset: { mode: body, xyz: [0.0, 0.0, 0.0] }
+  right:
+    back_rigid_id: 1
+    wrist_offset: { mode: body, xyz: [0.0, 0.0, 0.0] }
+"""
+    cfg = _load(cfg_text)
+    assert cfg.hands["left"].back_rigid_id == 2
+    assert cfg.hands["right"].back_rigid_id == 1
+    assert cfg.back_rigid_id == 1
+    assert cfg.objects == {"cylinder": 3}
+
+
+def test_hand_needs_pose_source():
+    """每只手必须指定 back_rigid_id 或 wrist_rigid_id 至少一个。"""
+    bad = """
+router:
+  endpoint: "tcp/127.0.0.1:7447"
+rigid_bodies:
+  back: 5
+  objects: {}
+hands:
+  left:
+    wrist_rigid_id: 2
+  right: {}
+"""
+    with pytest.raises(ConfigError, match="back_rigid_id 或 wrist_rigid_id"):
+        _load(bad)

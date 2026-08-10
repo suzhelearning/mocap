@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from acquisition.config import Config, load_config
-from acquisition.recorder import EV_DISCARD, EV_PAUSE, EV_RESUME, EV_SAVE, EV_START
+from acquisition.recorder import EV_DISCARD, EV_SAVE, EV_START
 from acquisition.state_machine import State, TakeController
 
 TEST_CONFIG = """
@@ -76,13 +76,6 @@ def test_full_cycle_save(tmp_path):
     assert writers[0].begin_args[0] == 1
     assert ("event", EV_START, "start") in writers[0].events
 
-    assert ctrl.handle(" ") is True
-    assert ctrl.state is State.PAUSED
-    assert ("event", EV_PAUSE, "pause") in writers[0].events
-    assert ctrl.handle(" ") is True
-    assert ctrl.state is State.RECORDING
-    assert ("event", EV_RESUME, "resume") in writers[0].events
-
     assert ctrl.handle("s") is True
     assert ctrl.state is State.IDLE
     assert writers[0].saved
@@ -142,5 +135,5 @@ def test_status_line(tmp_path):
     assert "空闲" in ctrl.status_line()
     ctrl.handle("r")
     assert "录制中" in ctrl.status_line()
-    ctrl.handle(" ")
-    assert "已暂停" in ctrl.status_line()
+    ctrl.handle("s")
+    assert "空闲" in ctrl.status_line()

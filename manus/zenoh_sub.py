@@ -30,7 +30,7 @@ def main():
 
     cfg = zenoh.Config()
     if args.router:
-        cfg.insert_json5("connect/endpoints", f'["{args.router}"]')
+        cfg.insert_json5("connect/endpoints", json.dumps([args.router]))
 
     session = zenoh.open(cfg)
     counts = {}

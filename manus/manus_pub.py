@@ -3,7 +3,7 @@
 
 从 stdin 读取 rawviz 协议（HAND/EDGE/FRAME/POS），发布为 ROS2 话题：
 
-  /manus/raw_skeleton/<side>        geometry_msgs/PoseArray   25 节点位置（帧率 ~30Hz）
+  /manus/raw_skeleton/<side>        geometry_msgs/PoseArray   25 节点位置（帧率 ~120Hz）
   /manus/skeleton_edges/<side>      std_msgs/Int32MultiArray  (child,parent) 对，一次性
 
 用法（Zenoh 传输）:

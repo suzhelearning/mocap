@@ -171,3 +171,95 @@ def test_hub_rejects_bad_frames():
     assert len(got) == 1
     assert hub.latest_mocap()["frame_number"] == 7
     assert hub.latest_mocap()["t_ubuntu_ns"] > 0
+
+
+def test_hub_ignores_unknown_side():
+    """rawviz 异常输出的 Unknown 侧:忽略而非 KeyError(纯单元测试)。"""
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    nodes = [[0.0, 0.0, 0.0] for _ in range(25)]
+    hub._on_manus(_FakeSample("manus/raw_skeleton/unknown", json.dumps(
+        {"glove_id": "x", "side": "unknown", "seq": 1, "nodes": nodes})))
+    hub._on_edges(_FakeSample("manus/skeleton_edges/unknown", json.dumps(
+        {"glove_id": "x", "edges": [[1, 0, 13]]})))
+    # 未崩溃即通过;left/right 槽位未被污染
+    assert hub.latest_manus("left") is None
+    assert hub.latest_manus("right") is None
+    assert hub.latest_edges("left") is None
+
+
+def test_hub_rejects_huge_edges():
+    """不受信注入的超大 edges 列表被 parse_edges 上限拒绝,不触发回调。"""
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    hub._on_edges(_FakeSample(MANUS_EDGE_KEYS[0], json.dumps(
+        {"glove_id": "x", "edges": [[i, 0, 13] for i in range(1, 70)]})))
+    assert hub.latest_edges("left") is None
+
+
+def test_hub_rejects_nan_manus():
+    """含 NaN 的 manus 帧被拒绝(有限性校验)。"""
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    nodes = [[0.0, 0.0, 0.0] for _ in range(25)]
+    nodes[0][0] = float("nan")
+    hub._on_manus(_FakeSample(MANUS_RAW_KEYS[0], json.dumps(
+        {"glove_id": "x", "side": "left", "seq": 1, "nodes": nodes})))
+    assert hub.latest_manus("left") is None
+
+
+# -- mocap_at 时刻插值 ------------------------------------------------------
+
+def _rb(rid, pos, quat=(0.0, 0.0, 0.0, 1.0), valid=True):
+    return {"id": rid, "position": pos,
+            "quaternion_xyzw": list(quat),
+            "mean_error": 0.0004, "tracking_valid": valid}
+
+
+def _mocap_frame_at(t, *rbs):
+    fr = _mocap_frame(0)
+    fr["rigid_bodies"] = [dict(rb) for rb in rbs]
+    return t, fr
+
+
+def test_mocap_at_interpolates_position_and_quat():
+    """中点时刻:位置 lerp + 四元数 slerp 正确。"""
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    q0 = (0.0, 0.0, 0.0, 1.0)                    # 恒等
+    q1 = (0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4))   # 绕 z 90°
+    hub._mocap_history.extend([
+        _mocap_frame_at(100, _rb(5, [0.0, 0.0, 0.0], q0)),
+        _mocap_frame_at(200, _rb(5, [0.2, 0.4, 0.0], q1)),
+    ])
+    mid = hub.mocap_at(150)                      # 中点
+    rb = next(r for r in mid["rigid_bodies"] if r["id"] == 5)
+    assert np.allclose(rb["position"], [0.1, 0.2, 0.0], atol=1e-6)
+    # 中点四元数 = 绕 z 45°
+    q = np.asarray(rb["quaternion_xyzw"])
+    assert np.allclose(q, [0.0, 0.0, np.sin(np.pi / 8), np.cos(np.pi / 8)], atol=1e-6)
+
+
+def test_mocap_at_out_of_range_takes_endpoint():
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    hub._mocap_history.extend([
+        _mocap_frame_at(100, _rb(5, [0.1, 0.0, 0.0])),
+        _mocap_frame_at(200, _rb(5, [0.2, 0.0, 0.0])),
+    ])
+    assert hub.mocap_at(50)["rigid_bodies"][0]["position"] == [0.1, 0.0, 0.0]
+    assert hub.mocap_at(999)["rigid_bodies"][0]["position"] == [0.2, 0.0, 0.0]
+
+
+def test_mocap_at_rigid_appearing_in_one_frame_only():
+    """仅在一帧出现的刚体直接取该帧,不插值。"""
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    hub._mocap_history.extend([
+        _mocap_frame_at(100, _rb(5, [0.1, 0.0, 0.0])),
+        _mocap_frame_at(200, _rb(5, [0.2, 0.0, 0.0]), _rb(7, [9.0, 9.0, 9.0])),
+    ])
+    rbs = {r["id"]: r for r in hub.mocap_at(150)["rigid_bodies"]}
+    assert rbs[7]["position"] == [9.0, 9.0, 9.0]   # 新出现,直接取
+    assert np.allclose(rbs[5]["position"], [0.15, 0.0, 0.0])
+
+
+def test_mocap_at_empty_history_returns_latest():
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    hub._on_mocap(_FakeSample(FRAME_KEY, encode_frame(_mocap_frame(7))))
+    fr = hub.mocap_at(1_000_000_000_000)
+    assert fr["frame_number"] == 7

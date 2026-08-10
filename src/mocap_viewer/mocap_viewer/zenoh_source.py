@@ -58,7 +58,15 @@ class ZenohSource:
         if self._connect_endpoint is not None:
             config: dict[str, object] = {"connect": {"endpoints": [self._connect_endpoint]}}
         else:
-            config = {"listen": {"endpoints": [self._listen_endpoint]}}
+            config = {
+                "listen": {"endpoints": [self._listen_endpoint]},
+                # 显式 TCP 直连,不参与组播/发现:避免误加入本地其它 zenoh 网络
+                # (如常驻 router),收到/扩散非本链路数据(安全暴露面 + 测试污染)
+                "scouting": {
+                    "multicast": {"enabled": False},
+                    "gossip": {"enabled": False},
+                },
+            }
         return zenoh.Config.from_json5(json.dumps(config))
 
     def _on_sample(self, sample: object) -> None:
@@ -66,8 +74,12 @@ class ZenohSource:
         frame = self._handler.handle_json(sample.payload.to_string())
         if frame is None:
             return
-        if self._relay and not frame.get(RELAY_MARKER):
-            # 转发给 connect 模式的消费者；带标记的帧是自己发布的，跳过防回环
+        if self._relay:
+            if frame.get(RELAY_MARKER):
+                # 自己转发出去的回环副本:不入队、不转发,否则每帧重复入队
+                # (统计失真)且经 router 重复投递给其它订阅者(重复录制)。
+                return
+            # 转发给 connect 模式的消费者;带标记的帧是自己发布的,跳过防回环
             frame[RELAY_MARKER] = True
             self._publisher.put(encode_frame(frame))
         self.queue.put_latest(frame)

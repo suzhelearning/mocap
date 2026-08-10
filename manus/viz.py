@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """viz.py — Manus Metaglove raw 骨架 25 关键点 3D 可视化（Viser / 浏览器）
 
-从 stdin 读取 rawviz 输出（HAND/EDGE/FRAME/POS 协议），推送到 Viser 服务器，
+从 stdin 读取 rawviz 输出（HAND/EDGE/POS 独立流协议），推送到 Viser 服务器，
 浏览器打开 http://<host>:<port> 实时查看。
 
 用法:
@@ -11,7 +11,7 @@
 
 参数:
     --port PORT     Viser 端口（默认 8080）
-    --host HOST     监听地址（默认 0.0.0.0，局域网可访问）
+    --host HOST     监听地址（默认 127.0.0.1；局域网访问需显式指定本机 IP 并自行防护）
     --replay FILE   回放模式：从文件读数据
     --fast          回放时不按帧间隔 sleep，直接推完
 """
@@ -90,25 +90,38 @@ class Hand:
 # ---------------------------------------------------------------------------
 
 def handle_line(line, hands):
+    """返回 True 表示有新骨架数据(POS 行),调用方据此刷新场景。
+
+    POS 协议(独立流): POS <gloveId> <seq> <x0 y0 z0 ...>
+    """
     parts = line.split()
     if not parts:
-        return
+        return False
     tag = parts[0]
-    if tag == "HAND" and len(parts) >= 4:
-        h = Hand(parts[1], parts[2], int(parts[3]))
-        hands[h.glove_id] = h
-    elif tag == "EDGE" and len(parts) == 5:
-        h = hands.get(parts[1])
-        if h:
-            h.add_edge(int(parts[2]), int(parts[3]), int(parts[4]))
-    elif tag == "POS" and len(parts) >= 4:
-        h = hands.get(parts[1])
-        if h:
-            vals = np.asarray(parts[2:2 + h.node_count * 3], dtype=float)
-            if vals.size == h.node_count * 3:
-                h.pos = vals.reshape(h.node_count, 3)
-                h.valid = True
-    # FRAME 及其他行（SDK 初始化日志等）忽略
+    try:
+        if tag == "HAND" and len(parts) >= 4:
+            node_count = int(parts[3])
+            if node_count <= 0:
+                return False
+            h = Hand(parts[1], parts[2], node_count)
+            hands[h.glove_id] = h
+        elif tag == "EDGE" and len(parts) == 5:
+            h = hands.get(parts[1])
+            if h:
+                h.add_edge(int(parts[2]), int(parts[3]), int(parts[4]))
+        elif tag == "POS" and len(parts) >= 5:
+            h = hands.get(parts[1])
+            if h:
+                vals = np.asarray(parts[3:3 + h.node_count * 3], dtype=float)
+                if vals.size == h.node_count * 3:
+                    h.pos = vals.reshape(h.node_count, 3)
+                    h.valid = True
+                    return True
+    except ValueError:
+        # 单行畸形(非数字 token)不影响链路:跳过,继续下一行
+        return False
+    # 其他行（SDK 初始化日志等）忽略
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +131,7 @@ def handle_line(line, hands):
 def main():
     ap = argparse.ArgumentParser(description="Manus raw 骨架 Viser 可视化")
     ap.add_argument("--port", type=int, default=8090)
-    ap.add_argument("--host", type=str, default="0.0.0.0")
+    ap.add_argument("--host", type=str, default="127.0.0.1")
     ap.add_argument("--replay", type=str, default=None)
     ap.add_argument("--fast", action="store_true")
     args = ap.parse_args()
@@ -168,14 +181,11 @@ def main():
         with open(args.replay) as f:
             last = time.time()
             for line in f:
-                if line.strip() == "FRAME" or line.startswith("FRAME"):
-                    line = line.strip()
-                handle_line(line, hands)
-                if line.startswith("FRAME"):
+                if handle_line(line.strip(), hands):
                     frame_no += 1
                     refresh()
                     if not args.fast:
-                        time.sleep(max(0, 0.033 - (time.time() - last)))
+                        time.sleep(max(0, 0.008 - (time.time() - last)))
                         last = time.time()
         print(f"回放结束，共 {frame_no} 帧，服务器保持运行（Ctrl+C 退出）")
         try:
@@ -185,13 +195,11 @@ def main():
             pass
         return
 
-    # 实时模式
+    # 实时模式（左右手独立流:任何一手 POS 即刷新）
     print("可视化已启动：浏览器打开上方 viser 输出的地址（本机或局域网）")
     try:
         for line in sys.stdin:
-            line = line.strip()
-            handle_line(line, hands)
-            if line.startswith("FRAME"):
+            if handle_line(line.strip(), hands):
                 frame_no += 1
                 refresh()
     except KeyboardInterrupt:

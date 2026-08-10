@@ -20,7 +20,7 @@ import zenoh
 
 from natnet_zenoh.schema import FRAME_KEY, encode_frame
 from natnet_zenoh.subscriber import FrameHandler, FrameStats
-from natnet_zenoh.zenoh_transport import build_peer_config
+from natnet_zenoh.zenoh_transport import build_client_config
 
 
 def _positive_float(value: str) -> float:
@@ -71,7 +71,8 @@ def main(argv: list[str] | None = None) -> int:
         if frame is not None and recorder is not None:
             recorder.write(frame)
 
-    config = build_peer_config(connect_endpoint=args.connect_endpoint)
+    # client 模式连 zenohd Router(peer→router 不路由数据,见 CONSUMING.md)
+    config = build_client_config(connect_endpoint=args.connect_endpoint)
     stop_event = threading.Event()
     print(
         f"Subscribing to {args.key} via {args.connect_endpoint} (Ctrl-C to stop)",

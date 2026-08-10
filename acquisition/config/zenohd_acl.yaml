@@ -1,0 +1,28 @@
+# zenohd Router 访问控制(ACL)配置
+# 由 start_zenohd.sh / install_zenohd_service.sh 以 `zenohd -c` 加载。
+#
+# 策略:默认拒绝,仅放行项目声明的数据 key 空间(mocap/** 与 manus/**)。
+# 效果:局域网内未授权主机无法向数据 key 发布伪造帧、无法订阅窃听,
+# 也无法借其它 key 空间探测/注入。若未来新增 key 空间,须在此同步放行。
+#
+# ⚠ 注意:ACL 按 key 表达式授权,不验证发布者身份;数据本身无加密。
+#   属演示/采集局域网环境下的最小加固,非高安全边界。
+#
+# 结构说明(subject 属性全省略 = 通配所有对端):
+#   subjects 定义主体 → policies 把 {subject × rules} 绑定为允许集。
+
+access_control:
+  enabled: true
+  default_permission: deny
+  subjects:
+    - id: anyone
+  rules:
+    - id: data-streams
+      key_exprs: ["mocap/**", "manus/**"]
+      messages: [put, declare_subscriber]
+      flows: [ingress, egress]
+      permission: allow
+  policies:
+    - id: allow-data
+      subjects: [anyone]
+      rules: [data-streams]

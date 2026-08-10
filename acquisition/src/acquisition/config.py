@@ -16,7 +16,6 @@ import yaml
 
 DEFAULT_KEYMAP = {
     "start": "r",
-    "pause": " ",
     "save": "s",
     "discard": "d",
     "quit": "q",
@@ -39,21 +38,22 @@ class WristOffset:
 @dataclass(frozen=True)
 class HandConfig:
     side: str
-    back_rigid_id: int
+    back_rigid_id: int | None = None      # 背部刚体基准(可省略,改用 wrist_rigid_id)
     wrist_offset: WristOffset = field(default_factory=WristOffset)
-    wrist_rigid_id: int | None = None     # 直接追踪手腕刚体时跳过 offset
+    wrist_rigid_id: int | None = None     # Motive 直接追踪手腕刚体时跳过 back/offset
 
 
 @dataclass(frozen=True)
 class Config:
     router_endpoint: str
-    back_rigid_id: int
+    back_rigid_id: int | None              # None=全部手用 wrist_rigid_id 直接追踪
     objects: dict[str, int]
     hands: dict[str, HandConfig]
     axis_permutation: tuple[int, int, int]
     axis_signs: tuple[int, int, int]
     output_dir: Path
     store_markers: bool
+    sample_hz: float               # 采集落盘目标频率(输入 120Hz 时默认降到 100Hz)
     keymap: dict[str, str]
     viz_port: int
     chunk_frames: int
@@ -114,8 +114,9 @@ def load_config(path: str | Path) -> Config:
     rb = _require(raw, "rigid_bodies", "config")
     if not isinstance(rb, dict):
         raise ConfigError("config.rigid_bodies 必须是映射")
-    back_id = _require(rb, "back", "rigid_bodies")
-    if not isinstance(back_id, int):
+    # back 可选:Motive 直接追踪手腕刚体(hands 全部配 wrist_rigid_id)时可省略
+    back_id = rb.get("back")
+    if back_id is not None and not isinstance(back_id, int):
         raise ConfigError("rigid_bodies.back 必须是整数 ID")
     objects_raw = rb.get("objects", {})
     if not isinstance(objects_raw, dict):
@@ -138,19 +139,30 @@ def load_config(path: str | Path) -> Config:
         h = hands_raw[side]
         if not isinstance(h, dict):
             raise ConfigError(f"config.hands.{side} 必须是映射")
-        hid = _require(h, "back_rigid_id", f"hands.{side}")
-        if not isinstance(hid, int):
-            raise ConfigError(f"hands.{side}.back_rigid_id 必须是整数 ID")
-        if hid != back_id and hid not in objects.values():
-            raise ConfigError(f"hands.{side}.back_rigid_id {hid} 未在 rigid_bodies 中声明")
         wrist_rid = h.get("wrist_rigid_id")
         if wrist_rid is not None and not isinstance(wrist_rid, int):
             raise ConfigError(f"hands.{side}.wrist_rigid_id 必须是整数 ID")
+        hid = h.get("back_rigid_id")
+        if hid is not None and not isinstance(hid, int):
+            raise ConfigError(f"hands.{side}.back_rigid_id 必须是整数 ID")
+        # 每只手必须能确定位姿来源:back_rigid_id 或 wrist_rigid_id 至少一个。
+        # back_rigid_id 允许引用任意 Motive 刚体 ID(如手套背面 marker 刚体),
+        # 不要求出现在 rigid_bodies.back/objects 中;back 用于全局渲染与默认。
+        if hid is None and wrist_rid is None:
+            raise ConfigError(
+                f"hands.{side} 必须指定 back_rigid_id 或 wrist_rigid_id(至少一个)"
+            )
         hands[side] = HandConfig(
             side=side,
             back_rigid_id=hid,
             wrist_offset=_parse_offset(h.get("wrist_offset"), f"hands.{side}.wrist_offset"),
             wrist_rigid_id=wrist_rid,
+        )
+    # 无背部刚体时,所有手必须直接追踪手腕(否则拼接无基准)
+    if back_id is None and any(h.back_rigid_id is not None and h.wrist_rigid_id is None
+                               for h in hands.values()):
+        raise ConfigError(
+            "rigid_bodies.back 未配置,所有 hands 都必须使用 wrist_rigid_id"
         )
 
     axis = raw.get("axis_transform", {"permutation": [0, 2, 1], "signs": [1, 1, -1]})
@@ -177,6 +189,9 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError("recording 必须是映射")
     output_dir = Path(rec.get("output_dir", "captures"))
     store_markers = bool(rec.get("store_markers", True))
+    sample_hz = float(rec.get("sample_hz", 100.0))
+    if not (sample_hz > 0 and sample_hz <= 10000):
+        raise ConfigError(f"recording.sample_hz 必须是正数,实际 {sample_hz}")
     chunk_frames = int(rec.get("chunk_frames", 4096))
 
     keys_raw = raw.get("keys", {})
@@ -200,6 +215,7 @@ def load_config(path: str | Path) -> Config:
         axis_signs=tuple(signs),
         output_dir=output_dir,
         store_markers=store_markers,
+        sample_hz=sample_hz,
         keymap=keymap,
         viz_port=viz_port,
         chunk_frames=chunk_frames,

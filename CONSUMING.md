@@ -16,6 +16,7 @@ natnet-zenoh publisher ── Zenoh TCP 7447 ──→  Ubuntu 数据服务（vi
 ```
 
 - **发布端**：Windows 上的 natnet-zenoh publisher（Motive 同机，loopback 收数据）
+- **手部数据**：`manus/raw_skeleton/{left,right}_hand`（原始 25 节点）+ `manus/mano_skeleton/{left,right}_hand`（MANO/MediaPipe 21 点，同帧同步发布）
 - **数据通道**：有线直连 link-local（`169.254.1.0` ↔ `169.254.213.247`），TCP 7447，实测 ~0.3ms、120Hz、0 丢帧
 - **Zenoh 网络**：显式 TCP peer 连接；**必须先有人监听 7447（数据服务端），消费者再 connect 加入**
 - **服务端转发（relay）**：Zenoh 1.9 peer 只在直连对之间交换订阅路由，多跳转发不可靠。因此数据服务端（`view`）收到帧后会**重新发布到同一 key**（带 `relayed_by_mocap_viewer` 标记防回环），connect 模式的消费者相当于直连发布者，数据稳定可达。不需要转发时可加 `--no-relay`。
@@ -34,13 +35,8 @@ pixi run subscribe -- --connect-endpoint tcp/169.254.1.0:7447   # 指定数据�
 
 > 端口说明：`view` 监听 0.0.0.0:7447；`subscribe` 用 connect 模式连接已有服务端，**不**占用端口，可与 view 并存。
 
-无 Motive 时可用合成数据本地验证：
-
-```bash
-pixi run view &             # 终端 1：数据服务端
-pixi run demo-publish       # 终端 2：60Hz 合成帧（connect 127.0.0.1:7447）
-pixi run subscribe          # 终端 3：消费者
-```
+> 无数据时的行为：数据服务端/采集程序在未收到任何流时会持续提示「⏳ 等待设备启动」，
+> 设备(Motive/Windows publisher、Manus 手套)就绪后自动恢复。
 
 ## 用代码消费
 

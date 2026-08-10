@@ -73,3 +73,51 @@ def test_raw_keyboard_non_tty():
     t.join(timeout=3)
     os.close(r)
     os.close(w)
+
+
+def test_raw_keyboard_on_idle_called():
+    """select 超时(无按键)时 on_idle 被周期调用(主循环 tick 接线点)。"""
+    master, slave = pty.openpty()
+    idles = []
+    stop = threading.Event()
+    ready = threading.Event()
+
+    t = threading.Thread(
+        target=raw_keyboard, args=(lambda ch: None, stop, slave, ready),
+        kwargs={"on_idle": lambda: idles.append(1)}, daemon=True)
+    t.start()
+    try:
+        assert ready.wait(2.0), "raw 模式未就绪"
+        deadline = time.time() + 3
+        while len(idles) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(idles) >= 2        # 50ms 轮询周期,3 秒内应多次触发
+        # 按键仍被读取
+        os.write(master, b"x")
+    finally:
+        stop.set()
+        t.join(timeout=3)
+        os.close(master)
+        os.close(slave)
+
+
+def test_raw_keyboard_on_idle_non_tty():
+    """非终端 fd 同样在轮询空隙调用 on_idle(后台运行主循环可用)。"""
+    r, w = os.pipe()
+    idles = []
+    stop = threading.Event()
+    t = threading.Thread(
+        target=raw_keyboard, args=(lambda ch: None, stop, r),
+        kwargs={"on_idle": lambda: idles.append(1)}, daemon=True)
+    t.start()
+    try:
+        deadline = time.time() + 3
+        while len(idles) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(idles) >= 2
+        os.write(w, b"q")             # 管道数据仍被读取
+    finally:
+        stop.set()
+        t.join(timeout=3)
+        os.close(r)
+        os.close(w)

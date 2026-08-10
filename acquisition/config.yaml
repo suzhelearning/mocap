@@ -5,27 +5,28 @@ router:
   endpoint: "tcp/127.0.0.1:7447"   # Ubuntu 本机 zenohd(常驻 Router)
 
 # Motive 中定义的刚体(Motive Y-up 右手系、米制)
+# 命名分工:
+#   Manus 手骨架   → left_hand / right_hand(zenoh topic: manus/raw_skeleton/{left,right}_hand)
+#   Motive 手腕刚体 → left_wrist / right_wrist(手背 marker 构建,需 offset 推算手腕)
+# ⚠ 实测确认:刚体 ID 1 = right_wrist,2 = left_wrist(左/右按操作者物理左右;
+#   曾按相反假设配置导致双手数据/坐标轴错位,勿再改回)
 rigid_bodies:
-  back: 5                          # 背部 markers 刚体 ID(与 Motive 工程一致)
+  back: 2
   objects:                         # 物体刚体 ID → 名字(采集时各物体单独建刚体)
-    cup: 11
-    tray: 12
+    cylinder: 3
 
 hands:
   left:
-    back_rigid_id: 5
-    wrist_offset:                  # 背部刚体身体系下的手腕偏移(需真机标定)
-      mode: body                   # body=随背部刚体旋转(推荐);world=固定世界方向
-      xyz: [0.15, -0.30, -0.05]    # 身体系:右肩方向、上、背方向(典型值)
-      # yaw_deg: 0                 # 可选:手腕相对背部刚体的固定姿态修正
-      # pitch_deg: 0
-      # roll_deg: 0
-    # wrist_rigid_id: 8            # 可选:若 Motive 直接追踪手腕刚体,用其位姿跳过 offset
+    back_rigid_id: 2               # Motive 刚体 left_wrist(实测 2 号)
+    wrist_offset:                  # ⚠ 未标定,占位零偏移:链路验证可用,数据不真实
+      mode: body                   # body=随刚体旋转(推荐);world=固定世界方向
+      xyz: [0.0, 0.0, 0.0]         # 标定后填:手背刚体 → 手腕的实际偏移
   right:
-    back_rigid_id: 5
+    back_rigid_id: 1               # Motive 刚体 right_wrist(实测 1 号)
     wrist_offset:
       mode: body
-      xyz: [-0.15, -0.30, -0.05]   # 左肩方向、上、背方向
+      xyz: [0.0, 0.0, 0.0]
+  # 若 Motive 直接追踪手腕刚体(无 offset 场景),改用 wrist_rigid_id 即可
 
 axis_transform:                    # Manus 骨架(z-up) → Motive 系(y-up) 轴变换
   permutation: [0, 2, 1]           # 输出 = (输入[0], 输入[2], 输入[1])
@@ -33,13 +34,13 @@ axis_transform:                    # Manus 骨架(z-up) → Motive 系(y-up) 轴
   # 标定:开 live_view 看手指方向;上/下颠倒改 signs,左/右颠倒改 permutation
 
 recording:
-  output_dir: "captures"
+  output_dir: "/home/current/data"   # 数据根目录;录制自动建 <日期>/ 子目录,文件名=时间
   store_markers: true              # true=存原始 markers(vlen);false=只存刚体+手腕+手部
+  sample_hz: 100                   # 采集落盘目标频率(输入流 120Hz 时下采样;web 可动态改)
   chunk_frames: 4096               # HDF5 resize 批大小
 
 keys:
   start: r                         # 空闲 → 开始录制
-  pause: " "                       # 录制 ↔ 暂停
   save: s                          # 停止并保存
   discard: d                       # 停止并丢弃
   quit: q                          # 退出(录制中先丢弃当前 take)

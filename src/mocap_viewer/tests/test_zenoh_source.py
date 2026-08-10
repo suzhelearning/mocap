@@ -206,6 +206,7 @@ def test_source_relay_forwards_unmarked_frame() -> None:
 
 
 def test_source_relay_skips_marked_frame() -> None:
+    """自己转发回来的回环副本:不转发、也不入队(否则每帧重复显示/统计失真)。"""
     session = FakeSession()
     source = make_source(session, relay=True)
     source.start()
@@ -213,4 +214,6 @@ def test_source_relay_skips_marked_frame() -> None:
     frame[RELAY_MARKER] = True  # 模拟自己转发回来的帧
     feed(source, frame)
     assert session.publisher.put_payloads == []  # 防回环
+    assert source.queue.empty()                   # 回环副本不入队
+    assert source.stats.received_frames == 1      # 统计仍计一次(原始帧)
     source.stop()
