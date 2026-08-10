@@ -20,6 +20,8 @@ h5py = ">=3.11,<4"
 pyyaml = ">=6,<7"
 viser = ">=1.0.30,<2"
 pytest = ">=8,<9"
+scipy = ">=1.18.0,<2"
+"ruamel.yaml" = ">=0.19.1,<0.20"
 
 [pypi-dependencies]
 eclipse-zenoh = ">=1.9,<1.10"

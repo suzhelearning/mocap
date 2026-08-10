@@ -23,6 +23,8 @@ from natnet_zenoh.schema import FRAME_KEY, decode_frame
 
 from .kinematics import quat_slerp
 
+RIGID_BODY_NAMES_KEY = "mocap/rigid_body_names"   # Windows publisher 发布的刚体名→ID
+
 from .manus_schema import (
     MANUS_EDGE_KEYS,
     MANUS_RAW_KEYS,
@@ -59,6 +61,8 @@ class StreamHub:
 
         self._latest_mocap: dict | None = None
         self._mocap_history: deque[tuple[int, dict]] = deque()   # (t_ubuntu_ns, frame)
+        self._rigid_body_names: dict[int, str] = {}              # id → 名字
+        self._rigid_body_ids: dict[str, int] = {}                # 名字 → id
         self._latest_manus: dict[str, dict] = {"left": None, "right": None}
         self._latest_mano: dict[str, dict] = {"left": None, "right": None}
         self._latest_edges: dict[str, list[tuple[int, int, int]]] = {}
@@ -205,6 +209,10 @@ class StreamHub:
             self._subscribers.append(
                 self._session.declare_subscriber(FRAME_KEY, self._on_mocap)
             )
+            self._subscribers.append(
+                self._session.declare_subscriber(
+                    RIGID_BODY_NAMES_KEY, self._on_rigid_body_names)
+            )
             for key in MANUS_RAW_KEYS:
                 self._subscribers.append(
                     self._session.declare_subscriber(key, self._on_manus)
@@ -237,6 +245,32 @@ class StreamHub:
                 pass
 
     # -- zenoh 回调(库线程,禁止阻塞) ---------------------------------------
+
+    def _on_rigid_body_names(self, sample: object) -> None:
+        """缓存 Windows publisher 发布的刚体名字→ID 映射。"""
+        try:
+            msg = json.loads(sample.payload.to_string())
+        except Exception:
+            return
+        names = msg.get("names")
+        if not isinstance(names, dict):
+            return
+        mapping: dict[int, str] = {}
+        for rid_s, name in names.items():
+            try:
+                mapping[int(rid_s)] = str(name)
+            except (ValueError, TypeError):
+                continue
+        self._rigid_body_names = mapping
+        self._rigid_body_ids = {name: rid for rid, name in mapping.items()}
+
+    def rigid_body_id(self, name: str) -> int | None:
+        """按刚体名字查 id(未收到名字表返回 None)。"""
+        return self._rigid_body_ids.get(name)
+
+    def rigid_body_name(self, rid: int) -> str | None:
+        """按刚体 id 查名字。"""
+        return self._rigid_body_names.get(rid)
 
     def _on_mocap(self, sample: object) -> None:
         try:

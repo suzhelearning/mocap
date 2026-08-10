@@ -59,6 +59,7 @@ class Config:
     chunk_frames: int
     config_path: Path
     config_text: str                      # 原样保存进 HDF5 attrs,便于溯源
+    user: str = "default"          # 操作者:与 manus --user 一致,合并 offset/<user>.yaml
 
     def axis_matrix(self) -> np.ndarray:
         """骨架系 → Motive 系的 3×3 轴变换矩阵。(A·d)_j = signs[j]·d[permutation[j]]"""
@@ -206,7 +207,9 @@ def load_config(path: str | Path) -> Config:
     viz = raw.get("viz", {})
     viz_port = int(viz.get("port", 8081)) if isinstance(viz, dict) else 8081
 
-    return Config(
+    user = str(raw.get("user", "default"))
+
+    cfg = Config(
         router_endpoint=str(router["endpoint"]),
         back_rigid_id=back_id,
         objects=objects,
@@ -219,6 +222,59 @@ def load_config(path: str | Path) -> Config:
         keymap=keymap,
         viz_port=viz_port,
         chunk_frames=chunk_frames,
+        user=user,
         config_path=path.resolve(),
         config_text=path.read_text(encoding="utf-8"),
+    )
+    # 合并按用户标定的 offset:offset/<user>.yaml 覆盖 hands.<side>.wrist_offset
+    return _merge_user_offset(cfg)
+
+
+def _merge_user_offset(cfg: Config) -> Config:
+    """若 offset/<user>.yaml 存在,用其中 left/right 的标定覆盖对应 wrist_offset。
+
+    与 manus 的 --user 同一用户体系(如 syz/yq/shd):
+    标定脚本 calibrate_wrist_offset.py --user <名> 写入 acquisition/offset/<名>.yaml。
+    """
+    offset_path = cfg.config_path.parent / "offset" / f"{cfg.user}.yaml"
+    if not offset_path.is_file():
+        return cfg
+    try:
+        raw = yaml.safe_load(offset_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return cfg
+    if not isinstance(raw, dict):
+        return cfg
+    hands = dict(cfg.hands)
+    for side in ("left", "right"):
+        o = raw.get(side)
+        if not isinstance(o, dict):
+            continue
+        try:
+            offset = _parse_offset(o, f"offset/{cfg.user}.yaml.{side}")
+        except ConfigError:
+            continue
+        h = hands[side]
+        hands[side] = HandConfig(
+            side=h.side, back_rigid_id=h.back_rigid_id,
+            wrist_offset=offset, wrist_rigid_id=h.wrist_rigid_id,
+        )
+    if hands == cfg.hands:
+        return cfg
+    return Config(
+        router_endpoint=cfg.router_endpoint,
+        back_rigid_id=cfg.back_rigid_id,
+        objects=cfg.objects,
+        hands=hands,
+        axis_permutation=cfg.axis_permutation,
+        axis_signs=cfg.axis_signs,
+        output_dir=cfg.output_dir,
+        store_markers=cfg.store_markers,
+        sample_hz=cfg.sample_hz,
+        keymap=cfg.keymap,
+        viz_port=cfg.viz_port,
+        chunk_frames=cfg.chunk_frames,
+        user=cfg.user,
+        config_path=cfg.config_path,
+        config_text=cfg.config_text,
     )

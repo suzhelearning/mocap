@@ -4,25 +4,32 @@
 router:
   endpoint: "tcp/127.0.0.1:7447"   # Ubuntu 本机 zenohd(常驻 Router)
 
+user: hbw                           # 操作者:与 manus_pub.sh --user 一致;
+                                    # 自动合并 offset/<user>.yaml 的 wrist 标定
+
 # Motive 中定义的刚体(Motive Y-up 右手系、米制)
-# 命名分工:
-#   Manus 手骨架   → left_hand / right_hand(zenoh topic: manus/raw_skeleton/{left,right}_hand)
-#   Motive 手腕刚体 → left_wrist / right_wrist(手背 marker 构建,需 offset 推算手腕)
-# ⚠ 实测确认:刚体 ID 1 = right_wrist,2 = left_wrist(左/右按操作者物理左右;
-#   曾按相反假设配置导致双手数据/坐标轴错位,勿再改回)
+# ⚠ 命名勘误(用户确认):Motive 里名为 right_wrist 的刚体(id=1)实际在【左手】,
+#   名为 left_wrist(id=2)实际在【右手】;left_dip(id=4)在左手。以下按物理位置配置,
+#   勿再按 Motive 名字改回。
 rigid_bodies:
-  back: 2
+  back: 1
   objects:                         # 物体刚体 ID → 名字(采集时各物体单独建刚体)
     cylinder: 3
 
 hands:
   left:
-    back_rigid_id: 2               # Motive 刚体 left_wrist(实测 2 号)
+    back_rigid_id: 1               # 物理左手腕(Motive 名 right_wrist,命名错误)
     wrist_offset:                  # ⚠ 未标定,占位零偏移:链路验证可用,数据不真实
       mode: body                   # body=随刚体旋转(推荐);world=固定世界方向
-      xyz: [0.0, 0.0, 0.0]         # 标定后填:手背刚体 → 手腕的实际偏移
+      xyz:                         # 标定后填:手背刚体 → 手腕的实际偏移
+      - 0.0442
+      - -0.0289
+      - -0.087
+      yaw_deg: -146.77
+      pitch_deg: -64.15
+      roll_deg: 69.75
   right:
-    back_rigid_id: 1               # Motive 刚体 right_wrist(实测 1 号)
+    back_rigid_id: 2               # 物理右手腕(Motive 名 left_wrist,命名错误)
     wrist_offset:
       mode: body
       xyz: [0.0, 0.0, 0.0]

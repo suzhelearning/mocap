@@ -263,3 +263,20 @@ def test_mocap_at_empty_history_returns_latest():
     hub._on_mocap(_FakeSample(FRAME_KEY, encode_frame(_mocap_frame(7))))
     fr = hub.mocap_at(1_000_000_000_000)
     assert fr["frame_number"] == 7
+
+
+def test_hub_rigid_body_names_mapping():
+    """刚体名字表订阅:按名字查 id、按 id 查名字。"""
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    hub._on_rigid_body_names(_FakeSample(
+        "mocap/rigid_body_names",
+        json.dumps({"names": {"2": "left_wrist", "4": "left_dip", "1": "right_wrist"}})))
+    assert hub.rigid_body_id("left_dip") == 4
+    assert hub.rigid_body_id("right_wrist") == 1
+    assert hub.rigid_body_name(2) == "left_wrist"
+    assert hub.rigid_body_id("no_such") is None
+    # 覆盖更新
+    hub._on_rigid_body_names(_FakeSample(
+        "mocap/rigid_body_names", json.dumps({"names": {"5": "left_dip"}})))
+    assert hub.rigid_body_id("left_dip") == 5
+    assert hub.rigid_body_id("left_wrist") is None

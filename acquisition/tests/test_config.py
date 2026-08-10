@@ -204,3 +204,60 @@ hands:
 """
     with pytest.raises(ConfigError, match="back_rigid_id 或 wrist_rigid_id"):
         _load(bad)
+
+
+def test_user_offset_merge(tmp_path):
+    """offset/<user>.yaml 按用户覆盖 hands.<side>.wrist_offset(与 manus --user 一致)。"""
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text("""
+router:
+  endpoint: "tcp/127.0.0.1:7447"
+user: syz
+rigid_bodies:
+  back: 2
+  objects: { cylinder: 3 }
+hands:
+  left:  { back_rigid_id: 2, wrist_offset: { mode: body, xyz: [0, 0, 0] } }
+  right: { back_rigid_id: 1, wrist_offset: { mode: body, xyz: [0, 0, 0] } }
+axis_transform: { permutation: [0, 2, 1], signs: [1, 1, -1] }
+recording: { output_dir: "captures", store_markers: false, sample_hz: 100 }
+""")
+    (tmp_path / "offset").mkdir()
+    (tmp_path / "offset" / "syz.yaml").write_text("""
+left:
+  mode: body
+  xyz: [0.021, -0.0125, 0.0148]
+  yaw_deg: 8.2
+  pitch_deg: -5.1
+  roll_deg: 3.0
+""")
+    cfg = load_config(cfg_path)
+    assert cfg.user == "syz"
+    lo = cfg.hands["left"].wrist_offset
+    assert lo.xyz == (0.021, -0.0125, 0.0148)
+    assert lo.yaw_deg == 8.2 and lo.pitch_deg == -5.1 and lo.roll_deg == 3.0
+    # 未标定的 right 保持配置默认
+    assert cfg.hands["right"].wrist_offset.xyz == (0.0, 0.0, 0.0)
+
+
+def test_user_offset_ignored_when_user_missing(tmp_path):
+    """无对应 offset 文件(或 user 不同)时不合并。"""
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text("""
+router:
+  endpoint: "tcp/127.0.0.1:7447"
+user: shd
+rigid_bodies:
+  back: 2
+  objects: {}
+hands:
+  left:  { back_rigid_id: 2 }
+  right: { back_rigid_id: 1 }
+axis_transform: { permutation: [0, 2, 1], signs: [1, 1, -1] }
+recording: { output_dir: "captures", store_markers: false, sample_hz: 100 }
+""")
+    (tmp_path / "offset").mkdir()
+    (tmp_path / "offset" / "syz.yaml").write_text("left:\n  xyz: [9, 9, 9]\n")
+    cfg = load_config(cfg_path)
+    assert cfg.user == "shd"
+    assert cfg.hands["left"].wrist_offset.xyz == (0.0, 0.0, 0.0)
