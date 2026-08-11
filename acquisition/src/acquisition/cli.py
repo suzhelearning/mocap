@@ -227,8 +227,14 @@ def main(argv: list[str] | None = None) -> int:
             last_flush = now
         if viz is not None:
             edges = {s: hub.latest_edges(s) or [] for s in ("left", "right")}
+            # 标定刚体 id(按名字解析;名字表未到则为空,UI 侧全部按普通显示)
+            calib_ids = {
+                rid for name in ("left_wrist", "left_dip", "right_wrist", "right_dip")
+                if (rid := hub.rigid_body_id(name)) is not None
+            }
             viz.update(hub.latest_mocap(), latest_hands, edges,
                        latest_mano=latest_mano,
+                       calib_rigid_ids=calib_ids,
                        status=_status_fields(), state=ctrl.state)
         if now - last_status >= STATUS_INTERVAL:
             sys.stdout.write(f"\r\x1b[K{_status_text()}")

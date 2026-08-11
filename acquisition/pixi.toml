@@ -10,6 +10,7 @@ record = "python -m acquisition.cli"
 record-noviz = "python -m acquisition.cli --no-viz"
 inspect = "python scripts/inspect_hdf5.py"
 replay = "python scripts/replay_hdf5.py"
+viz-h5 = "python scripts/viz_hdf5.py"
 test = "pytest"
 start-router = "bash scripts/start_zenohd.sh"
 

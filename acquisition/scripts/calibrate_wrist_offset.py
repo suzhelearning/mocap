@@ -49,11 +49,11 @@ MOVE_POS_M = 0.004          # 位移 >4mm/帧 视为移动
 MOVE_ANG_DEG = 1.5          # 姿态变化 >1.5°/帧 视为移动
 
 POSE_HINTS = [
-    "掌心朝下,手平放",
-    "掌心朝上,手平放",
-    "手竖起,掌心朝前",
-    "手竖起,掌心朝内(手侧倾)",
-    "手掌朝外/朝下侧倾(与前 4 个明显不同朝向)",
+    "掌心朝下,中指伸直",
+    "掌心朝上,中指弯曲",
+    "掌心朝左,中指伸直",
+    "掌心朝右,中指弯曲",
+    "掌心朝自己,中指伸直",
 ]
 
 
@@ -187,12 +187,17 @@ def static_check(frames) -> tuple[bool, float, float, float]:
     return ok, pos_mm, ang_max, ref_mm
 
 
-def pose_average(frames, ref_node: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """姿势样本:窗口平均的 (p_b, q_b_xyzw, v_ref, p_ref)。"""
+def pose_average(frames, ref_node: int, axis: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """姿势样本:窗口平均的 (p_b, q_b_xyzw, v_ref, p_ref)。
+
+    v_ref = A·(参照节点 − 手掌 root):先做骨架系→Motive 轴约定变换,
+    使标定解出的 R_gb 只含贴装残余旋转(与拼接公式 g = p_w + R_w·A·d 一致,
+    避免 A 被 R_gb 吸收后双重旋转)。
+    """
     poss = np.asarray([f[0] for f in frames]).mean(axis=0)
     mid = frames[len(frames) // 2][1]                 # 四元数取中间帧
     nodes = np.asarray([f[2] for f in frames]).mean(axis=0)
-    v_ref = nodes[ref_node] - nodes[0]                # 参照节点 − 手掌 root
+    v_ref = axis @ (nodes[ref_node] - nodes[0])       # 轴变换后的参照向量
     p_ref = np.asarray([f[3] for f in frames]).mean(axis=0)
     return poss, mid, v_ref, p_ref
 
@@ -248,11 +253,13 @@ def is_moving(prev, curr) -> bool:
 class AutoSegmenter:
     """自动姿势分段状态机:静止确认 → 采集 → 移动切换下一姿势。"""
 
-    def __init__(self, poses: int, hold_s: float, settle_s: float, ref_node: int):
+    def __init__(self, poses: int, hold_s: float, settle_s: float, ref_node: int,
+                 axis: np.ndarray):
         self.target = poses
         self.hold_s = hold_s
         self.settle_s = settle_s
         self.ref_node = ref_node
+        self.axis = axis
         self.samples = []                     # 完成的姿势样本
         self._state = "IDLE"                  # IDLE / SETTLING / SAMPLING
         self._settle_start: float | None = None
@@ -279,7 +286,8 @@ class AutoSegmenter:
                     print(f"[标定]   静止质量不足(位移 {pos_mm:.1f}mm/姿态 {ang_deg:.1f}°),"
                           "请重新摆好并保持", file=sys.stderr)
                 else:
-                    p_b, q_b, v_ref, p_ref = pose_average(self._seg, self.ref_node)
+                    p_b, q_b, v_ref, p_ref = pose_average(self._seg, self.ref_node,
+                                                          self.axis)
                     self.samples.append((p_b, q_b, v_ref, p_ref))
                     print(f"[标定]   姿势 {len(self.samples)}/{self.target} 完成"
                           f"(位移 {pos_mm:.1f}mm,姿态 {ang_deg:.1f}°)。"
@@ -305,12 +313,12 @@ class AutoSegmenter:
             self._seg = []
 
 
-def run_auto(streams: LiveStreams, args, back_id: int) -> list:
+def run_auto(streams: LiveStreams, args, back_id: int, axis: np.ndarray) -> list:
     """分段标定:每姿势按 Enter 确认开始,段内自动静止检测与重采。"""
     print("[标定] 分段模式:每个姿势摆好后按 Enter 开始采集;"
           f"采集中手动了会自动重采。共 {args.poses} 个姿势")
-    print("[标定] 姿势提示:掌心朝下平放 → 掌心朝上 → 竖起掌心朝前 → "
-          "侧倾 → 另一侧倾(朝向差异越大越好)")
+    print("[标定] 关键:相邻姿势间切换「中指伸直/弯曲」手型(采集时保持不动),"
+          "配合手腕朝向变化,才能分离位置与旋转")
     samples = []
     for i in range(args.poses):
         hint = POSE_HINTS[i] if i < len(POSE_HINTS) else "任意与前几个明显不同的朝向"
@@ -323,7 +331,7 @@ def run_auto(streams: LiveStreams, args, back_id: int) -> list:
                 print(f"[标定]   检测到手部移动(位移 {pos_mm:.1f}mm / "
                       f"姿态 {ang_deg:.1f}°),自动重采...", file=sys.stderr)
                 continue
-            p_b, q_b, v_ref, p_ref = pose_average(frames, args.node)
+            p_b, q_b, v_ref, p_ref = pose_average(frames, args.node, axis)
             print(f"[标定]   姿势 {i + 1}/{args.poses} 完成"
                   f"(位移 {pos_mm:.1f}mm,姿态 {ang_deg:.1f}°)。请切换下一个姿势",
                   flush=True)
@@ -370,11 +378,17 @@ def main() -> int:
     global args_node
     args_node = args.node
 
-    # 读 config:back 刚体 id
+    # 读 config:back 刚体 id 与轴变换 A(骨架系→Motive 系)
     try:
         import yaml as _pyyaml
         cfg_raw = _pyyaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
         back_id_cfg = cfg_raw["hands"][args.side]["back_rigid_id"]
+        ax = cfg_raw.get("axis_transform", {})
+        perm = ax.get("permutation", [0, 2, 1])
+        signs = ax.get("signs", [1, 1, -1])
+        A = np.zeros((3, 3), dtype=float)
+        for j in range(3):
+            A[j, perm[j]] = signs[j]
     except Exception as exc:
         print(f"[标定] 读取 {args.config} 失败: {exc}", file=sys.stderr)
         return 2
@@ -422,7 +436,7 @@ def main() -> int:
             return 1
 
         if args.auto:
-            samples = run_auto(streams, args, back_id)
+            samples = run_auto(streams, args, back_id, A)
         else:
             samples = []
             for i in range(args.poses):
@@ -438,7 +452,7 @@ def main() -> int:
                               file=sys.stderr)
                         input("   重新摆好后按 Enter")
                         continue
-                    p_b, q_b, v_ref, p_ref = pose_average(frames, args.node)
+                    p_b, q_b, v_ref, p_ref = pose_average(frames, args.node, A)
                     print(f"[标定]   姿势 {i + 1} 采集完成"
                           f"(位移 {pos_mm:.1f}mm,姿态 {ang_deg:.1f}°)")
                     samples.append((p_b, q_b, v_ref, p_ref))

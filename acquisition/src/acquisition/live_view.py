@@ -62,6 +62,18 @@ MANO_PALETTE = np.asarray([
     (69, 123, 157), (69, 123, 157), (69, 123, 157), (69, 123, 157),
 ], dtype=np.uint8)
 
+# MANO 手掌连线:wrist(0) → 五根手指根部(食指/中指/无名指/小指 MCP,拇指 CMC)
+MANO_PALM_EDGES = ((0, 1), (0, 5), (0, 9), (0, 13), (0, 17))
+# 手指链:四指 MCP→PIP→DIP→TIP;拇指 CMC→MCP→IP→TIP
+MANO_FINGER_EDGES = (
+    (1, 2), (2, 3), (3, 4),        # 拇指
+    (5, 6), (6, 7), (7, 8),        # 食指
+    (9, 10), (10, 11), (11, 12),   # 中指
+    (13, 14), (14, 15), (15, 16),  # 无名指
+    (17, 18), (18, 19), (19, 20),  # 小指
+)
+MANO_PALM_LINE_COLOR = (170, 170, 170)
+
 
 @dataclass(frozen=True)
 class TableSpec:
@@ -238,8 +250,17 @@ class StitchedScene:
             side: self.server.scene.add_point_cloud(
                 f"/mano/{side}", points=np.zeros((0, 3)),
                 colors=np.zeros((0, 3), dtype=np.uint8),
-                point_size=0.010, point_shape="circle", precision="float32",
+                point_size=0.005, point_shape="circle", precision="float32",
                 point_shading="gradient", visible=False,
+            )
+            for side in ("left", "right")
+        }
+        # MANO 手掌连线(腕→各指根),与 21 点同显隐
+        self._mano_lines = {
+            side: self.server.scene.add_line_segments(
+                f"/mano/{side}/palm", points=np.zeros((0, 2, 3)),
+                colors=np.zeros((0, 2, 3), dtype=np.uint8),
+                line_width=3.0, visible=False,
             )
             for side in ("left", "right")
         }
@@ -249,7 +270,16 @@ class StitchedScene:
             point_size=0.012, point_shape="circle", precision="float32",
             point_shading="gradient",
         )
+        # 刚体组成 markers(id_kind=asset_member,即 left_wrist/left_dip 等):
+        # 标定完成后默认隐藏,由「left_rigid」开关控制
+        self._rigid_marker_pc = self.server.scene.add_point_cloud(
+            "/rigid_markers", points=np.zeros((0, 3)),
+            colors=np.zeros((0, 3), dtype=np.uint8),
+            point_size=0.012, point_shape="circle", precision="float32",
+            point_shading="gradient", visible=False,
+        )
         self._show_markers = True
+        self._show_rigid_markers = False
         self._table_handles: list[object] = []
         self._render_table()
 
@@ -290,6 +320,9 @@ class StitchedScene:
                 "标记点大小", min=0.002, max=0.05, step=0.001, initial_value=0.012)
             self._show_markers_cb = self.server.gui.add_checkbox(
                 "原始标记点", initial_value=True)
+            self._btn_rigid = self.server.gui.add_button(
+                "left_rigid", color=(200, 60, 60),
+                hint="点击切换标定刚体(left_wrist/left_dip)markers 显示")
             self._show_mano_cb = self.server.gui.add_checkbox(
                 "MANO 21 点", initial_value=True)
             self._show_hands_cb = self.server.gui.add_checkbox(
@@ -328,6 +361,11 @@ class StitchedScene:
         self._marker_size.on_update(lambda _e: self._apply_marker_style())
         self._show_markers_cb.on_update(lambda _e: setattr(self, "_show_markers",
                                                            self._show_markers_cb.value))
+
+        @self._btn_rigid.on_click
+        async def _toggle_rigid(_e):
+            # 点击切换刚体 markers 显示(状态由场景反馈:开=出现刚体 markers)
+            self._show_rigid_markers = not self._show_rigid_markers
         self._show_mano_cb.on_update(lambda _e: setattr(self, "_show_mano",
                                                         self._show_mano_cb.value))
         self._show_hands_cb.on_update(lambda _e: self._apply_hand_visibility())
@@ -431,6 +469,7 @@ class StitchedScene:
         hands: dict[str, dict],
         edges: dict[str, list[tuple[int, int, int]]],
         latest_mano: dict[str, dict | None] | None = None,
+        calib_rigid_ids: set[int] | None = None,
         status: dict[str, str] | None = None,
         state: State | None = None,
     ) -> None:
@@ -496,26 +535,60 @@ class StitchedScene:
             mesh.pc.visible = self._show_hands
             mesh.ls.visible = self._show_hands
 
-            # MANO/MediaPipe 21 关键点(分色点云)
+            # MANO/MediaPipe 21 关键点(分色点云 + 手掌连线)
             mano = (latest_mano or {}).get(side)
             pc = self._mano_pc[side]
+            ln = self._mano_lines[side]
             if self._show_mano and mano is not None and mano.get("keypoints_global") is not None:
-                pc.points = np.asarray(mano["keypoints_global"], dtype=float)
+                kp = np.asarray(mano["keypoints_global"], dtype=float)
+                pc.points = kp
                 pc.colors = MANO_PALETTE
                 pc.visible = True
+                # 连线:手掌线(灰)+ 手指链(按手指色,取起点颜色)
+                seg = np.asarray(
+                    [[kp[a], kp[b]] for a, b in MANO_PALM_EDGES + MANO_FINGER_EDGES],
+                    dtype=np.float32)
+                palm_colors = np.full((len(MANO_PALM_EDGES), 2, 3),
+                                      MANO_PALM_LINE_COLOR, dtype=np.uint8)
+                finger_colors = np.asarray(
+                    [[MANO_PALETTE[a], MANO_PALETTE[a]]
+                     for a, _b in MANO_FINGER_EDGES], dtype=np.uint8)
+                ln.points = seg
+                ln.colors = np.concatenate([palm_colors, finger_colors], axis=0)
+                ln.visible = True
             else:
                 pc.points = np.zeros((0, 3))
                 pc.visible = False
+                ln.points = np.zeros((0, 2, 3))
+                ln.visible = False
 
-        # 原始 markers(按跟踪状态配色)
-        if self._show_markers and mocap_frame is not None:
+        # markers 分流:
+        #   普通 markers + 其他刚体(cylinder 等)→ 原始标记点(默认显示)
+        #   标定刚体(left_wrist/left_dip/right_wrist/right_dip)→ left_rigid button 控制
+        if mocap_frame is not None:
             markers = mocap_frame.get("markers", [])
+            calib = calib_rigid_ids or set()
             pts = np.asarray([m["position"] for m in markers], dtype=float)
             colors = np.asarray([marker_color(m) for m in markers], dtype=np.uint8)
-            self._marker_pc.points = pts
-            self._marker_pc.colors = colors
+            calib_mask = np.asarray([
+                m.get("id_kind") == "asset_member"
+                and m.get("model_id") in calib
+                for m in markers])
+            if self._show_markers and markers:
+                self._marker_pc.points = pts[~calib_mask]
+                self._marker_pc.colors = colors[~calib_mask]
+            else:
+                self._marker_pc.points = np.zeros((0, 3))
+            if self._show_rigid_markers and markers:
+                self._rigid_marker_pc.points = pts[calib_mask]
+                self._rigid_marker_pc.colors = colors[calib_mask]
+                self._rigid_marker_pc.visible = True
+            else:
+                self._rigid_marker_pc.points = np.zeros((0, 3))
+                self._rigid_marker_pc.visible = False
         else:
             self._marker_pc.points = np.zeros((0, 3))
+            self._rigid_marker_pc.points = np.zeros((0, 3))
 
         # 录制按钮状态
         self.update_state(state)

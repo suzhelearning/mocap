@@ -1,0 +1,18 @@
+left:
+  mode: body
+  xyz:
+  - 0.0206
+  - -0.025
+  - -0.0967
+  yaw_deg: -135.19
+  pitch_deg: -70.4
+  roll_deg: 149.43
+right:
+  mode: body
+  xyz:
+  - 0.0378
+  - 0.0235
+  - -0.0923
+  yaw_deg: -118.13
+  pitch_deg: -42.78
+  roll_deg: 97.47

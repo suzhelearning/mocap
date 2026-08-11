@@ -4,7 +4,7 @@
 router:
   endpoint: "tcp/127.0.0.1:7447"   # Ubuntu 本机 zenohd(常驻 Router)
 
-user: hbw                           # 操作者:与 manus_pub.sh --user 一致;
+user: shd                           # 操作者:与 manus_pub.sh --user 一致;
                                     # 自动合并 offset/<user>.yaml 的 wrist 标定
 
 # Motive 中定义的刚体(Motive Y-up 右手系、米制)
@@ -22,17 +22,23 @@ hands:
     wrist_offset:                  # ⚠ 未标定,占位零偏移:链路验证可用,数据不真实
       mode: body                   # body=随刚体旋转(推荐);world=固定世界方向
       xyz:                         # 标定后填:手背刚体 → 手腕的实际偏移
-      - 0.0442
-      - -0.0289
-      - -0.087
-      yaw_deg: -146.77
-      pitch_deg: -64.15
-      roll_deg: 69.75
+      - 0.0206
+      - -0.025
+      - -0.0967
+      yaw_deg: -135.19
+      pitch_deg: -70.4
+      roll_deg: 149.43
   right:
     back_rigid_id: 2               # 物理右手腕(Motive 名 left_wrist,命名错误)
     wrist_offset:
       mode: body
-      xyz: [0.0, 0.0, 0.0]
+      xyz:
+      - 0.0378
+      - 0.0235
+      - -0.0923
+      yaw_deg: -118.13
+      pitch_deg: -42.78
+      roll_deg: 97.47
   # 若 Motive 直接追踪手腕刚体(无 offset 场景),改用 wrist_rigid_id 即可
 
 axis_transform:                    # Manus 骨架(z-up) → Motive 系(y-up) 轴变换
