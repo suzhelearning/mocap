@@ -9,5 +9,10 @@ __pycache__/
 # compiled artifacts
 rawviz.out
 
+# agent harness artifacts
+.agents/
+.claude/
+skills-lock.json
+
 # nested independent repo (hosted at suzhelearning/natnet)
 natnet/

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sys
 import threading
 import time
@@ -28,95 +29,21 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import h5py
 import numpy as np
+import h5py
 import viser
 from viser import ViserServer
 
-# ---- 配色与拓扑(与 live_view.py 保持一致) ----
-CHAIN_COLORS = {
-    5: (244, 162, 97),    # 拇指 橙
-    6: (42, 157, 143),    # 食指 青
-    7: (233, 196, 106),   # 中指 黄
-    8: (231, 111, 81),    # 无名指 橙红
-    9: (69, 123, 157),    # 小指 蓝
-    13: (210, 210, 210),  # 手掌 亮灰
-}
-DEFAULT_COLOR = (160, 160, 160)
-
-MARKER_COLORS = {
-    "active": (45, 212, 191),
-    "asset_member": (74, 222, 128),
-    "point_cloud": (251, 146, 60),
-    "unknown": (148, 163, 184),
-}
-OCCLUDED_COLOR = (239, 68, 68)
-
-# MANO 25 节点:0=手腕,1-4=拇指,5-8=食指,9-12=中指,13-16=无名指,17-20=小指,
-# 21-24=手掌扩展点(不连线)
-MANO_PALETTE = np.asarray(
-    [(210, 210, 210)]                       # 0 手腕
-    + [(244, 162, 97)] * 4                  # 拇指
-    + [(42, 157, 143)] * 4                  # 食指
-    + [(233, 196, 106)] * 4                 # 中指
-    + [(231, 111, 81)] * 4                  # 无名指
-    + [(69, 123, 157)] * 4                  # 小指
-    + [(160, 160, 160)] * 4,                # 手掌扩展
-    dtype=np.uint8,
+from acquisition.viser_core import (
+    apply_frame,
+    build_scene_nodes,
+    extract_hdf5,
+    nearest_idx,
+    probe_h5,
+    reject_external_links,
 )
-MANO_PALM_EDGES = ((0, 1), (0, 5), (0, 9), (0, 13), (0, 17))
-MANO_FINGER_EDGES = (
-    (1, 2), (2, 3), (3, 4),        # 拇指
-    (5, 6), (6, 7), (7, 8),        # 食指
-    (9, 10), (10, 11), (11, 12),   # 中指
-    (13, 14), (14, 15), (15, 16),  # 无名指
-    (17, 18), (18, 19), (19, 20),  # 小指
-)
-
-# 刚体 ID → 标签(与 config.yaml 对应;未配置的 ID 显示原始编号)
-RIGID_LABELS = {1: "左腕(back)", 2: "右腕(back)", 3: "cylinder"}
-
-HAND_EDGES = [(c, p) for c, p in MANO_PALM_EDGES] + list(MANO_FINGER_EDGES)
-
-# 存储为数字索引(recorder._KIND_INDEX)
-KIND_INDEX = {"active": 0, "asset_member": 1, "point_cloud": 2, "unknown": 3}
-_KIND_COLORS = {v: MARKER_COLORS[k] for k, v in KIND_INDEX.items()}
 
 _IFRAME_PORT = 0   # 占位:main 里按控制端口 +1 设置
-
-
-def reject_external_links(f: h5py.File, prefix: str = "") -> None:
-    """递归检查并拒绝含外部/软链接的 HDF5(不解析链接,仅查类型)。"""
-    for name in f:
-        link = f.get(name, getlink=True)
-        if not isinstance(link, h5py.HardLink):
-            raise ValueError(
-                f"拒绝含 {type(link).__name__} 的 HDF5: {prefix}{name}"
-                + (f" -> {link.filename}" if isinstance(link, h5py.ExternalLink) else "")
-            )
-        obj = f[name]
-        if isinstance(obj, h5py.Group):
-            reject_external_links(obj, f"{prefix}{name}/")
-
-
-def _nearest_idx(t: np.ndarray, t_ns: float) -> int:
-    """在单调时间戳数组上取 t_ns 的最近邻下标(夹取到边界)。"""
-    i = int(np.searchsorted(t, t_ns, side="right")) - 1
-    return min(max(i, 0), t.size - 1)
-
-
-def _quat_xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
-    return q[[3, 0, 1, 2]]
-
-
-def _marker_colors(kinds, occluded) -> np.ndarray:
-    colors = np.zeros((len(kinds), 3), dtype=np.uint8)
-    for i, (kind, occ) in enumerate(zip(kinds, occluded)):
-        if bool(occ):
-            colors[i] = OCCLUDED_COLOR
-            continue
-        colors[i] = _KIND_COLORS.get(int(kind), MARKER_COLORS["unknown"])
-    return colors
 
 
 @dataclass
@@ -125,24 +52,180 @@ class _Playback:
     playing: bool = True
     speed: float = 1.0
 
-
 class VizScene:
     """viser 3D 回放场景;动画由服务端线程驱动,支持运行时切换文件。"""
 
-    def __init__(self, port: int) -> None:
+    def __init__(self, port: int, mano_enabled: bool = False) -> None:
         self.playback = _Playback()
         self.t0 = 0
         self.t1 = 0
         self.dur_s = 0.0
         self.path: Path | None = None
         self.error: str | None = None
+        self.mano_enabled = bool(mano_enabled)
+        self.mano_error: str | None = None
+        self._mano_layers: dict[str, object] = {}
+        self._mano_betas: dict[str, np.ndarray] = {}   # side -> beta (10,) 或 None
+        self._mano_fit_mesh = None
+        self._mano_handles: dict[str, object] = {}
+        self._mano_last_idx: dict[str, int] = {}
+        self._mano_last_params: dict[str, np.ndarray] = {}
+        self._mano_generation = 0
+        self._mano_lock = threading.Condition()
+        self._mano_pending: dict[str, tuple[int, int, np.ndarray, np.ndarray | None]] = {}
+        self._mano_results: dict[str, tuple[int, int, np.ndarray, np.ndarray]] = {}
 
         self.server = ViserServer(host="127.0.0.1", port=port)
+        self.server.gui.configure_theme(dark_mode=True)   # 黑色主题
+        # Motive 数据是 y-up；通过 viser 官方 up-direction 机制保持 y-up。
+        # 这样根节点负责统一变换，数据、相机和灯光处在同一个坐标约定中；
+        # 不再手动把 y-up 数据旋到 z-up，也不覆盖 viser 的根节点姿态。
+        self.server.scene.set_up_direction((0.0, 1.0, 0.0))
+        self.server.initial_camera.position = (0.038, 4.176, -5.413)
+        self.server.initial_camera.look_at = (0.0, 1.0, 0.0)
+        self.server.initial_camera.up = (0.0, -1.0, 0.0)
+        self.server.initial_camera.fov = 50.0
+        # 每次连接（含断线重连）强制回到同一 y-up 俯视姿态。
+        self.server.on_client_connect(self._reset_camera)
+        # 数据/桌面整体抬高 1m；原始 H5 坐标不修改，地面 grid 仍在 y=0。
+        self.world_frame = self.server.scene.add_frame(
+            "/world", position=(0.0, 1.0, 0.0), show_axes=False,
+        )
         self._scene_ready = False
         self._anim_thread = threading.Thread(
             target=self._animate, name="viz-h5-anim", daemon=True,
         )
+        self._mano_thread = threading.Thread(
+            target=self._mano_worker, name="viz-h5-mano", daemon=True,
+        )
         self._anim_thread.start()
+        self._mano_thread.start()
+
+    def _reset_camera(self, client: viser.ClientHandle) -> None:
+        """连接回调:强制相机回到默认视角（y-up 世界,画面上下翻转）。"""
+        client.camera.position = (0.038, 4.176, -5.413)
+        client.camera.look_at = (0.0, 1.0, 0.0)
+        client.camera.up_direction = (0.0, -1.0, 0.0)
+
+    def _camera_state(self) -> dict | None:
+        """取最近更新的客户端相机状态(viser 世界坐标),无客户端返回 None。"""
+        best: tuple[viser.CameraHandle, float] | None = None
+        for c in self.server.get_clients().values():
+            cam = c.camera
+            try:
+                ts = cam.update_timestamp
+            except AssertionError:
+                continue  # 尚未收到该客户端相机消息
+            if best is None or ts > best[1]:
+                best = (cam, ts)
+        if best is None:
+            return None
+        cam = best[0]
+        return {
+            "position": [round(float(v), 3) for v in cam.position],
+            "wxyz": [round(float(v), 3) for v in cam.wxyz],
+            "look_at": [round(float(v), 3) for v in cam.look_at],
+            "up_direction": [round(float(v), 3) for v in cam.up_direction],
+        }
+
+    def _ensure_mano_backend(self) -> None:
+        """按需加载 MANO 后端；普通骨架回放不依赖它。"""
+        if self._mano_fit_mesh is not None or self.mano_error is not None:
+            return
+        try:
+            from mano_fit import fit_mesh, load_mano
+
+            self._mano_fit_mesh = fit_mesh
+            self._mano_layers = {
+                side: load_mano(side) for side in ("left", "right")
+            }
+        except Exception as exc:
+            self.mano_error = f"{type(exc).__name__}: {exc}"
+
+    def _clear_mano_work(self) -> None:
+        with self._mano_lock:
+            self._mano_generation += 1
+            self._mano_pending.clear()
+            self._mano_results.clear()
+            self._mano_lock.notify_all()
+
+    def _mano_worker(self) -> None:
+        """后台拟合网格，避免数值优化阻塞骨架回放线程。"""
+        while True:
+            with self._mano_lock:
+                while not self._mano_pending:
+                    self._mano_lock.wait()
+                side = next(iter(self._mano_pending))
+                request = self._mano_pending.pop(side)
+            generation, index, obs, init = request
+            layer = self._mano_layers.get(side)
+            if layer is None or self._mano_fit_mesh is None:
+                continue
+            try:
+                verts, _joints, params = self._mano_fit_mesh(
+                    layer, obs, beta=self._mano_betas.get(side), init=init, iters=3,
+                )
+            except Exception as exc:
+                self.mano_error = f"MANO {side}: {type(exc).__name__}: {exc}"
+                continue
+            with self._mano_lock:
+                if generation == self._mano_generation:
+                    self._mano_results[side] = (
+                        generation, index, verts, params,
+                    )
+
+    def _request_mano(self, side: str, index: int) -> None:
+        if not self.mano_enabled or side not in self._mano_handles:
+            return
+        hand = self._data["hands"][side]
+        generation = self._mano_generation
+        with self._mano_lock:
+            result = self._mano_results.get(side)
+            pending = self._mano_pending.get(side)
+            if result is not None and result[0] == generation and result[1] == index:
+                return
+            if pending is not None and pending[0] == generation and pending[1] == index:
+                return
+            init = self._mano_last_params.get(side)
+            self._mano_pending[side] = (
+                generation, index, np.asarray(hand["nodes"][index], dtype=np.float64).copy(),
+                None if init is None else init.copy(),
+            )
+            self._mano_lock.notify()
+
+    def _update_mano_mesh(self, t_ns: float) -> None:
+        if not self._mano_handles:
+            return
+        with self._mano_lock:
+            results = list(self._mano_results.items())
+            self._mano_results.clear()
+        for side, (_generation, index, verts, params) in results:
+            if side not in self._mano_handles:
+                continue
+            self._mano_handles[side].vertices = verts
+            self._mano_last_idx[side] = index
+            self._mano_last_params[side] = params
+        for side, handle in self._mano_handles.items():
+            handle.visible = self.mano_enabled
+            if not self.mano_enabled:
+                continue
+            index = nearest_idx(self._data["hands"][side]["t"], t_ns)
+            if self._mano_last_idx.get(side) != index:
+                self._request_mano(side, index)
+
+    def set_mano_enabled(self, enabled: bool) -> None:
+        self.mano_enabled = bool(enabled)
+        if self._scene_ready:
+            self._update_mano_mesh(self.playback.t_ns)
+
+    def mano_state(self) -> dict:
+        return {
+            "available": bool(self._mano_handles),
+            "enabled": bool(self.mano_enabled and self._mano_handles),
+            "error": self.mano_error,
+            "beta_from_h5": {side: bool(b is not None)
+                             for side, b in self._mano_betas.items()},
+        }
 
     # ---- 数据加载(全部入内存;22s 录段仅数 MB) ----
     def load_file(self, path: Path) -> str | None:
@@ -150,14 +233,16 @@ class VizScene:
         try:
             with h5py.File(path, "r") as f:
                 reject_external_links(f)
-                data = self._extract(f)
+                data = extract_hdf5(f)
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             return self.error
 
+        self._clear_mano_work()
         self._data = data
         self.path = path
         self.error = None
+        self.mano_error = None
         self.t0 = int(data["t_mocap"][0])
         self.t1 = int(data["t_mocap"][-1])
         self.dur_s = (self.t1 - self.t0) / 1e9
@@ -165,167 +250,73 @@ class VizScene:
         self._rebuild_scene()
         return None
 
-    def _extract(self, f: h5py.File) -> dict:
-        mocap = f["mocap"]
-        t_mocap = mocap["t_ubuntu_ns"][:].astype(np.int64)
-        n = len(t_mocap)
-
-        # 刚体:vlen 行(一维铺平)→ 每帧 {id: (pos, quat_xyzw, valid)}
-        rb = mocap["rigid_bodies"]
-        rb_frames: list[dict[int, tuple[np.ndarray, np.ndarray, bool]]] = []
-        rb_ids: set[int] = set()
-        for i in range(n):
-            ids = np.asarray(rb["ids"][i])
-            pos = np.asarray(rb["positions"][i], dtype=np.float64).reshape(-1, 3)
-            quat = np.asarray(rb["quaternions_xyzw"][i], dtype=np.float64).reshape(-1, 4)
-            valid = np.asarray(rb["tracking_valid"][i])
-            frame = {}
-            for j, rid in enumerate(ids):
-                rid = int(rid)
-                frame[rid] = (pos[j], quat[j], bool(valid[j]))
-                rb_ids.add(rid)
-            rb_frames.append(frame)
-
-        # markers:vlen 行 → 每帧 (points, colors)
-        mk = mocap["markers"]
-        mk_frames: list[tuple[np.ndarray, np.ndarray]] = []
-        for i in range(n):
-            pts = np.asarray(mk["positions"][i], dtype=np.float32).reshape(-1, 3)
-            colors = _marker_colors(mk["id_kinds"][i], mk["occluded"][i])
-            mk_frames.append((pts, colors))
-
-        # 双手骨架(按自身时间戳对齐)
-        hands: dict[str, dict] = {}
-        for side in ("left", "right"):
-            g = f["hands"][side]
-            hands[side] = {
-                "t": g["t_ubuntu_ns"][:].astype(np.int64),
-                "nodes": g["nodes_global"][:],
-            }
-
-        return {
-            "t_mocap": t_mocap,
-            "rb_frames": rb_frames,
-            "rb_ids": rb_ids,
-            "mk_frames": mk_frames,
-            "hands": hands,
-        }
-
+    
     # ---- 场景节点(文件切换时整体重建) ----
     def _rebuild_scene(self) -> None:
         if self._scene_ready:
             for h in self._scene_handles:
                 h.remove()
-        sc = self.server.scene
-        data = self._data
-        handles: list = []
-
-        grid = sc.add_grid(
-            "/grid", width=2.0, height=2.0, cell_size=0.1, plane="xz",
-        )
-        handles.append(grid)
-        # 桌面区域参考框(TableSpec 默认值,y=0 平面)
-        x0, x1 = -0.72, 0.72
-        z0, z1 = -0.45, 0.45
-        seg = np.asarray([
-            [[x0, 0, z0], [x1, 0, z0]], [[x1, 0, z0], [x1, 0, z1]],
-            [[x1, 0, z1], [x0, 0, z1]], [[x0, 0, z1], [x0, 0, z0]],
-        ], dtype=np.float32)
-        table = sc.add_line_segments(
-            "/table", points=seg,
-            colors=np.full((4, 2, 3), (140, 140, 140), np.uint8), line_width=2.0,
-        )
-        handles.append(table)
-
-        # 刚体:每个出现过的 ID 一个坐标轴 + 标签
-        rigid_frames: dict[int, viser.FrameHandle] = {}
-        rigid_labels: dict[int, viser.LabelHandle] = {}
-        for rid in sorted(data["rb_ids"]):
-            label = RIGID_LABELS.get(rid, f"rigid:{rid}")
-            fh = sc.add_frame(f"/rigid/{rid}", axes_length=0.15, axes_radius=0.008)
-            lb = sc.add_label(f"/rigid/{rid}/label", label, position=(0, 0.05, 0))
-            rigid_frames[rid] = fh
-            rigid_labels[rid] = lb
-            handles.extend((fh, lb))
-
-        # markers 点云
-        marker_pc = sc.add_point_cloud(
-            "/markers", points=np.zeros((0, 3), np.float32),
-            colors=np.zeros((0, 3), np.uint8), point_size=0.01,
-            point_shape="circle", precision="float32", point_shading="gradient",
-        )
-        handles.append(marker_pc)
-
-        # 双手骨架
-        hand_pc: dict[str, viser.PointCloudHandle] = {}
-        hand_ls: dict[str, viser.LineSegmentsHandle] = {}
-        for side in ("left", "right"):
-            pc = sc.add_point_cloud(
-                f"/hand/{side}/points",
-                points=np.zeros((25, 3), np.float32), colors=MANO_PALETTE,
-                point_size=0.006, point_shape="circle", precision="float32",
-                point_shading="gradient",
-            )
-            seg0 = np.zeros((len(HAND_EDGES), 2, 3), np.float32)
-            per = np.asarray([CHAIN_COLORS.get(6, DEFAULT_COLOR)] * len(HAND_EDGES), np.uint8)
-            ls = sc.add_line_segments(
-                f"/hand/{side}/bones", points=seg0,
-                colors=np.repeat(per[:, None, :], 2, axis=1), line_width=2.0,
-            )
-            hand_pc[side] = pc
-            hand_ls[side] = ls
-            handles.extend((pc, ls))
-
-        self._rigid_frames = rigid_frames
-        self._rigid_labels = rigid_labels
-        self._marker_pc = marker_pc
-        self._hand_pc = hand_pc
-        self._hand_ls = hand_ls
-        self._scene_handles = handles
+        self._mano_handles.clear()
+        self._mano_last_idx.clear()
+        self._mano_last_params.clear()
+        self._mano_betas.clear()
+        self._ensure_mano_backend()
+        # 读取 H5 中离线写入的 beta(mano_beta.py);缺失则用 β=0
+        try:
+            with h5py.File(self.path, "r") as f:
+                reject_external_links(f)
+                for side in ("left", "right"):
+                    g = f.get("hands", {}).get(side)
+                    if g is not None and "mano_beta" in g:
+                        self._mano_betas[side] = np.asarray(
+                            g["mano_beta"][:], dtype=np.float64)
+        except Exception as exc:
+            self.mano_error = f"读取 mano_beta 失败: {exc}"
+        self._scene_nodes = build_scene_nodes(self.server.scene, self._data)
+        self._scene_handles = self._scene_nodes.handles
+        if self._mano_fit_mesh is not None:
+            for side in ("left", "right"):
+                hand = self._data["hands"][side]
+                if hand["nodes"].shape[1] != 21:
+                    continue
+                try:
+                    beta = self._mano_betas.get(side, np.zeros(10, dtype=np.float64))
+                    verts, _joints, params = self._mano_fit_mesh(
+                        self._mano_layers[side], hand["nodes"][0],
+                        beta=beta, iters=0,
+                    )
+                    mesh = self.server.scene.add_mesh_simple(
+                        f"/world/mano/{side}",
+                        vertices=verts,
+                        faces=self._mano_layers[side].faces,
+                        color=(224, 154, 154) if side == "left" else (154, 178, 224),
+                        opacity=0.62,
+                        side="double",
+                        material="standard",
+                        visible=self.mano_enabled,
+                    )
+                    self._mano_handles[side] = mesh
+                    self._mano_last_idx[side] = -1
+                    self._mano_last_params[side] = params
+                    self._scene_handles.append(mesh)
+                except Exception as exc:
+                    self.mano_error = (
+                        f"MANO {side}: {type(exc).__name__}: {exc}"
+                    )
         self._scene_ready = True
         self._apply_frame()
 
     # ---- 每帧更新 ----
     def _apply_frame(self) -> None:
         pb = self.playback
-        sc = self.server.scene
         data = self._data
 
-        i = _nearest_idx(data["t_mocap"], pb.t_ns)
-        t_cur = data["t_mocap"][i]
+        stats = apply_frame(self._scene_nodes, data, pb.t_ns)
+        self._update_mano_mesh(pb.t_ns)
+        i = stats["i"]
+        sc_elapsed = (stats["t"] - self.t0) / 1e9
+        return {"t": sc_elapsed, "dur": self.dur_s, "i": i, "n_mk": stats["n_mk"]}
 
-        # 刚体
-        frame = data["rb_frames"][i]
-        for rid, fh in self._rigid_frames.items():
-            if rid in frame:
-                pos, quat, _valid = frame[rid]
-                fh.position = pos
-                fh.wxyz = _quat_xyzw_to_wxyz(quat)
-                fh.visible = True
-                self._rigid_labels[rid].position = (pos[0], pos[1] + 0.05, pos[2])
-                self._rigid_labels[rid].visible = True
-            else:
-                fh.visible = False
-                self._rigid_labels[rid].visible = False
-
-        # markers
-        pts, colors = data["mk_frames"][i]
-        self._marker_pc.points = pts
-        self._marker_pc.colors = colors
-
-        # 双手
-        for side, h in data["hands"].items():
-            j = _nearest_idx(h["t"], pb.t_ns)
-            nodes = h["nodes"][j]
-            self._hand_pc[side].points = nodes
-            seg = np.asarray(
-                [[nodes[c], nodes[p]] for c, p in HAND_EDGES], np.float32
-            )
-            self._hand_ls[side].points = seg
-
-        n_mk = pts.shape[0]
-        sc_elapsed = (t_cur - self.t0) / 1e9
-        return {"t": sc_elapsed, "dur": self.dur_s, "i": i, "n_mk": n_mk}
 
     def _animate(self) -> None:
         """服务端动画线程:推进播放时间轴并更新场景(约 60fps)。"""
@@ -339,6 +330,7 @@ class VizScene:
                 pb.t_ns += pb.speed * dt * 1e9
                 if pb.t_ns > self.t1:
                     pb.t_ns = float(self.t0)      # 循环回放
+                self._apply_frame()
             time.sleep(0.016)
 
 
@@ -362,15 +354,29 @@ _PAGE_HTML = """<!DOCTYPE html>
   .file .meta { font-size: 11px; color: #888; margin-top: 2px; }
   #viewer { flex: 1; min-width: 0; position: relative; }
   iframe { width: 100%; height: 100%; border: 0; display: block; }
+  #camerapanel { position: absolute; top: 12px; right: 12px; width: 240px; z-index: 10;
+                 background: rgba(255,255,255,0.94); border: 1px solid #d4d4d4;
+                 border-radius: 8px; padding: 8px 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                 font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 11px;
+                 color: #333; pointer-events: none; }
+  #camerapanel .cp-title { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+                           font-size: 12px; font-weight: 600; color: #111; margin-bottom: 5px; }
+  #camerapanel .cp-row { display: flex; justify-content: space-between; gap: 8px; line-height: 1.55; }
+  #camerapanel .cp-row span:last-child { white-space: nowrap; }
+  #camerapanel .cp-k { color: #666; flex-shrink: 0; }
   #controls { display: flex; align-items: center; gap: 12px; padding: 8px 14px;
               border-top: 1px solid #e2e2e2; background: #f8f8f8; user-select: none; }
   #playbtn { width: 76px; padding: 7px 0; font-size: 14px; border-radius: 6px;
              border: 1px solid #c4c4c4; background: #fff; cursor: pointer; }
   #playbtn:hover { background: #eef2ff; }
+  #resetbtn { padding: 7px 12px; font-size: 13px; border-radius: 6px;
+              border: 1px solid #c4c4c4; background: #fff; cursor: pointer; }
+  #resetbtn:hover { background: #eef2ff; }
   #seekbar { flex: 1; }
   #timeinfo { min-width: 220px; text-align: right; font-family: ui-monospace, monospace;
               font-size: 12px; color: #333; }
   #speedwrap { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #444; }
+  #manowrap { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #444; }
   #speed { width: 90px; }
   #status { font-size: 12px; color: #b91c1c; }
 </style>
@@ -378,13 +384,21 @@ _PAGE_HTML = """<!DOCTYPE html>
 <body>
 <div id="main">
   <div id="sidebar"><h3>录制文件</h3><div id="filelist"></div></div>
-  <div id="viewer"><iframe id="viserframe" src=""></iframe></div>
+  <div id="viewer">
+    <iframe id="viserframe" src=""></iframe>
+    <div id="camerapanel">
+      <div class="cp-title">相机视角</div>
+      <div id="cp-body">连接中…</div>
+    </div>
+  </div>
 </div>
 <div id="controls">
   <button id="playbtn">▶ 播放</button>
   <div id="speedwrap"><span>倍速</span><input id="speed" type="range" min="10" max="500" value="100" step="10"><span id="speedval">1.0x</span></div>
+  <label id="manowrap"><input id="manocheck" type="checkbox"> MANO网格</label>
   <input id="seekbar" type="range" min="0" max="1000" value="0" step="1">
   <span id="timeinfo">-- / --</span>
+  <button id="resetbtn">重置视角</button>
   <span id="status"></span>
 </div>
 <script>
@@ -393,9 +407,11 @@ let dragging = false;
 let curFile = null;
 
 async function api(path, body) {
-  const opt = body !== undefined
-    ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-    : {};
+  const opt = { method: body !== undefined ? 'POST' : 'GET' };
+  if (body !== undefined) {
+    opt.headers = { 'Content-Type': 'application/json' };
+    opt.body = JSON.stringify(body);
+  }
   const r = await fetch(path, opt);
   return r.json();
 }
@@ -423,7 +439,7 @@ async function loadFile(name) {
 }
 
 async function togglePlay() {
-  const d = await api('/api/play');
+  const d = await api('/api/play', {});
   $('#playbtn').textContent = d.playing ? '⏸ 暂停' : '▶ 播放';
 }
 
@@ -435,9 +451,40 @@ async function pollState() {
     $('#timeinfo').textContent = d.t.toFixed(2) + 's / ' + d.dur.toFixed(2) + 's';
     $('#playbtn').textContent = d.playing ? '⏸ 暂停' : '▶ 播放';
   }
+  const mano = $('#manocheck');
+  mano.disabled = !d.mano.available;
+  mano.checked = d.mano.enabled;
+  if (d.mano.error && !d.mano.available) {
+    $('#status').textContent = 'MANO不可用: ' + d.mano.error;
+  }
+}
+
+async function toggleMano() {
+  const d = await api('/api/mano', { enabled: $('#manocheck').checked });
+  if (d.error) {
+    $('#status').textContent = d.error;
+    $('#manocheck').checked = false;
+  }
+}
+
+const camFmt = (v) => '(' + v.map(x => x.toFixed(3)).join(', ') + ')';
+
+$('#manocheck').onchange = toggleMano;
+async function pollCamera() {
+  const d = await api('/api/camera');
+  const body = $('#cp-body');
+  if (!d.connected) {
+    body.innerHTML = '<span style="color:#b91c1c">未连接客户端</span>';
+    return;
+  }
+  body.innerHTML =
+    '<div class="cp-row"><span class="cp-k">位置</span><span>' + camFmt(d.position) + '</span></div>' +
+    '<div class="cp-row"><span class="cp-k">注视点</span><span>' + camFmt(d.look_at) + '</span></div>' +
+    '<div class="cp-row"><span class="cp-k">朝向wxyz</span><span>' + camFmt(d.wxyz) + '</span></div>';
 }
 
 $('#playbtn').onclick = togglePlay;
+$('#resetbtn').onclick = async () => { await api('/api/reset-camera', {}); };
 $('#speed').oninput = async (e) => {
   const s = e.target.value / 100;
   $('#speedval').textContent = s.toFixed(1) + 'x';
@@ -452,6 +499,7 @@ $('#viserframe').src = 'http://127.0.0.1:__IFRAME_PORT__/';
 
 refreshFiles();
 setInterval(pollState, 200);
+setInterval(pollCamera, 250);
 </script>
 </body>
 </html>
@@ -496,11 +544,18 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/state":
             t = 0.0
             if scene._scene_ready:
-                i = _nearest_idx(scene._data["t_mocap"], scene.playback.t_ns)
+                i = nearest_idx(scene._data["t_mocap"], scene.playback.t_ns)
                 t = (scene._data["t_mocap"][i] - scene.t0) / 1e9
             self._send_json({"t": t, "dur": scene.dur_s,
                              "playing": scene.playback.playing,
-                             "speed": scene.playback.speed})
+                             "speed": scene.playback.speed,
+                             "mano": scene.mano_state()})
+        elif self.path == "/api/camera":
+            state = scene._camera_state()
+            if state is None:
+                self._send_json({"connected": False})
+            else:
+                self._send_json({"connected": True, **state})
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -528,8 +583,29 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/speed":
             scene.playback.speed = max(0.1, min(5.0, float(body.get("s", 1.0))))
             self._send_json({"ok": True})
+        elif self.path == "/api/mano":
+            if not scene.mano_state()["available"]:
+                self._send_json({"error": scene.mano_error or "当前文件没有21点手骨架"})
+            else:
+                scene.set_mano_enabled(bool(body.get("enabled", False)))
+                self._send_json(scene.mano_state())
+        elif self.path == "/api/reset-camera":
+            for client in scene.server.get_clients().values():
+                scene._reset_camera(client)
+            self._send_json({"ok": True})
         else:
             self._send_json({"error": "not found"}, 404)
+
+
+def _require_port_free(port: int, what: str) -> None:
+    """固定端口:被占则报错退出,不静默偏移(viser 内部会自动 +1,会造成 iframe 错位)。"""
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            print(f"[viz-h5] 端口 {port}({what})已被占用,请先释放: "
+                  f"ss -ltnp | grep {port}", file=sys.stderr)
+            raise SystemExit(2)
 
 
 def main() -> int:
@@ -537,6 +613,7 @@ def main() -> int:
     ap.add_argument("dir", type=str, help="日期文件夹,如 /home/current/data/20260811")
     ap.add_argument("--port", type=int, default=8082, help="控制页端口(viser 自动 +1)")
     ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--mano", action="store_true", help="启动时显示MANO网格")
     args = ap.parse_args()
 
     data_dir = Path(args.dir)
@@ -550,22 +627,19 @@ def main() -> int:
 
     global _IFRAME_PORT
     _IFRAME_PORT = args.port + 1
+    # 固定端口:冲突直接退出(viser 静默 +1 会使控制页 iframe 指向错误端口)
+    _require_port_free(args.port, "控制页")
+    _require_port_free(_IFRAME_PORT, "viser 场景")
 
     # 预扫描文件信息(仅读头部,安全防护同 inspect)
     files: list[dict] = []
     for p in h5_files:
-        try:
-            with h5py.File(p, "r") as f:
-                reject_external_links(f)
-                t = f["mocap/t_ubuntu_ns"][:]
-                dur = (t[-1] - t[0]) / 1e9
-                files.append({"name": p.name, "path": str(p),
-                              "dur": dur, "n_frames": len(t)})
-        except Exception as exc:
-            print(f"[viz-h5] 跳过 {p.name}: {type(exc).__name__}: {exc}",
-                  file=sys.stderr)
-
-    scene = VizScene(_IFRAME_PORT)
+        info = probe_h5(p)
+        if info is None:
+            print(f"[viz-h5] 跳过 {p.name}(无法读取或含外部链接)", file=sys.stderr)
+            continue
+        files.append(info)
+    scene = VizScene(_IFRAME_PORT, mano_enabled=args.mano)
     scene.playback.speed = args.speed
     err = scene.load_file(Path(files[0]["path"]))
     if err:
