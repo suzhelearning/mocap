@@ -173,6 +173,57 @@ def test_hub_rejects_bad_frames():
     assert hub.latest_mocap()["t_ubuntu_ns"] > 0
 
 
+def test_health_snapshot_counts_gaps_order_and_decode_errors():
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    for frame_number in (10, 13, 12):
+        hub._on_mocap(_FakeSample(
+            FRAME_KEY, encode_frame(_mocap_frame(frame_number))))
+    hub._on_mocap(_FakeSample(FRAME_KEY, "not-json"))
+
+    health = hub.health_snapshot()["streams"]["mocap"]
+    assert health["received"] == 3
+    assert health["sequence_gaps"] == 2
+    assert health["out_of_order"] == 1
+    assert health["decode_errors"] == 1
+
+
+def test_callbacks_are_serialized_off_input_threads():
+    hub = StreamHub("tcp/127.0.0.1:7447")
+    active = 0
+    max_active = 0
+    received = 0
+    lock = threading.Lock()
+
+    def slow_callback(_frame):
+        nonlocal active, max_active, received
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.002)
+        with lock:
+            active -= 1
+            received += 1
+
+    hub.on_mocap(slow_callback)
+    hub.on_manus("left", slow_callback)
+    hub._dispatch_stop.clear()
+    hub._dispatch_thread = threading.Thread(
+        target=hub._dispatch_loop, daemon=True)
+    hub._dispatch_thread.start()
+    nodes = [[0.0, 0.0, 0.0] for _ in range(25)]
+    for sequence in range(10):
+        hub._on_mocap(_FakeSample(
+            FRAME_KEY, encode_frame(_mocap_frame(sequence))))
+        hub._on_manus(_FakeSample(MANUS_RAW_KEYS[0], json.dumps({
+            "glove_id": "x", "side": "left",
+            "seq": sequence, "nodes": nodes,
+        })))
+    hub.stop()
+
+    assert received == 20
+    assert max_active == 1
+
+
 def test_hub_ignores_unknown_side():
     """rawviz 异常输出的 Unknown 侧:忽略而非 KeyError(纯单元测试)。"""
     hub = StreamHub("tcp/127.0.0.1:7447")

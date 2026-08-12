@@ -1,57 +1,83 @@
-"""RateGate — 采集落盘频率门控(线程安全,按流分槽)。
-
-输入流(动捕/手套均为 120Hz)在写入端按目标频率下采样:
-should_write(stream) 以接收端墙钟判断该流距上次写入是否 >= 1/hz 秒。
-
-规则:
-- 目标频率可运行时修改(set_hz),即时生效(web 下拉控件)
-- 流速率低于目标时不丢帧(全写,实际频率是多少算多少)
-- 被门控丢弃的帧不推迟 last 时间戳,避免实际频率低于目标
-- 按流分槽:每路流(动捕/左手/右手)独立维护写窗口,互不挤占,
-  保证每路流各自的落盘频率都达到目标值(而非三路共享一个节拍)
-"""
+"""按流独立的相位累加采样率门控，适配非整数频率与到达抖动。"""
 
 from __future__ import annotations
 
 import threading
-import time
 
 
 class RateGate:
-    def __init__(self, hz: float = 100.0) -> None:
-        self._hz = max(1.0, float(hz))
-        self._last_ns: dict[str, int] = {}
-        self._lock = threading.Lock()
+    """将每路输入下采样到目标频率，不让早到帧造成长期欠采样。
 
-    def set_hz(self, hz: float) -> None:
-        """运行时修改目标频率。"""
-        with self._lock:
-            self._hz = max(1.0, float(hz))
+    每路累计相邻输入帧贡献的目标周期份额；累计达到 1 才保留一帧。
+    这与“距上次保留帧至少一个周期”不同：102Hz 输入降至 100Hz 时，
+    早到的 9.8ms 会累计余量，而不会隔帧降成约 51Hz。
+    """
+
+    def __init__(self, hz: float) -> None:
+        self._hz = max(1.0, float(hz))
+        self._lock = threading.Lock()
+        self._last_ns: dict[str, int] = {}
+        self._phase: dict[str, float] = {}
+        self._stats: dict[str, dict[str, int]] = {}
 
     @property
     def hz(self) -> float:
         with self._lock:
             return self._hz
 
-    def should_write(self, now_ns: int | None = None, *, stream: str = "default") -> bool:
-        """该流该帧应写入返回 True;last 推进"写满窗口"而非帧时间戳。
-
-        帧时间戳语义会导致 120Hz 流 + 100Hz 目标实际降为 60Hz(每次写后
-        下一帧距该帧仅 8.3ms);窗口推进语义保证平均写入率 == 目标频率。
-        每路流独立窗口(stream 关键字参数,recorder 按流传入),互不影响。
-        now_ns 默认取当前墙钟,测试可注入固定时间戳(位置参数,兼容旧调用)。
-        """
-        now = time.time_ns() if now_ns is None else now_ns
+    def set_hz(self, hz: float) -> None:
         with self._lock:
-            period = 1e9 / self._hz
-            last = self._last_ns.get(stream, 0)
-            if now - last >= period:
-                skip = max(1, int((now - last) // period))
-                self._last_ns[stream] = last + int(period) * skip
-                return True
-            return False
+            self._hz = max(1.0, float(hz))
+            # 改频后下一帧作为新相位起点，立即采用新频率。
+            self._last_ns.clear()
+            self._phase.clear()
 
     def reset(self) -> None:
-        """清空全部流窗口(新 take 开始第一帧立即写入)。"""
+        """开始新 take 时重置相位与本 take 统计。"""
         with self._lock:
             self._last_ns.clear()
+            self._phase.clear()
+            self._stats.clear()
+
+    def should_write(self, t_ns: int, stream: str = "default") -> bool:
+        with self._lock:
+            stats = self._stats.setdefault(stream, {
+                "input": 0,
+                "kept": 0,
+                "rate_limited": 0,
+                "nonmonotonic": 0,
+            })
+            stats["input"] += 1
+            previous = self._last_ns.get(stream)
+            if previous is None:
+                self._last_ns[stream] = t_ns
+                self._phase[stream] = 0.0
+                stats["kept"] += 1
+                return True
+            if t_ns <= previous:
+                stats["nonmonotonic"] += 1
+                return False
+            elapsed = t_ns - previous
+            self._last_ns[stream] = t_ns
+            phase = min(
+                2.0,
+                self._phase.get(stream, 0.0) + elapsed * self._hz / 1e9,
+            )
+            if phase < 1.0:
+                self._phase[stream] = phase
+                stats["rate_limited"] += 1
+                return False
+            # 容量 2 的 token bucket 保留轻微早/晚到的相位余量，同时把
+            # 长间断后的追赶突发限制为至多一帧。
+            self._phase[stream] = phase - 1.0
+            stats["kept"] += 1
+            return True
+    def stats(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "target_hz": self._hz,
+                "streams": {
+                    stream: dict(values)
+                    for stream, values in self._stats.items()
+                },
+            }

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  acquisition:
+    name: acquisition (Python 3.12)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: acquisition
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Checkout natnet dependency
+        uses: actions/checkout@v4
+        with:
+          repository: suzhelearning/natnet
+          path: natnet
+      - name: Setup pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.41.3
+          cache: true
+      - name: Install locked environment
+        run: pixi install --locked
+      - name: Run acquisition tests
+        run: pixi run test
+      - name: Compile runtime scripts
+        run: >-
+          .pixi/envs/default/bin/python -m py_compile
+          src/acquisition/clock_sync.py
+          src/acquisition/cli.py
+          src/acquisition/live_view.py
+          src/acquisition/rate.py
+          src/acquisition/recorder.py
+          src/acquisition/streams.py
+          scripts/inspect_hdf5.py
+          scripts/replay_hdf5.py
+          scripts/viz_hdf5.py
+
+  natnet:
+    name: natnet-zenoh (Python 3.12)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: natnet
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Checkout natnet source
+        uses: actions/checkout@v4
+        with:
+          repository: suzhelearning/natnet
+          path: natnet
+      - name: Setup pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.41.3
+          cache: true
+      - name: Install locked environment
+        run: pixi install --locked
+      - name: Run NatNet tests
+        run: pixi run test
+
+  mocap-viewer:
+    name: mocap-viewer
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Checkout natnet dependency
+        uses: actions/checkout@v4
+        with:
+          repository: suzhelearning/natnet
+          path: natnet
+      - name: Setup pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.41.3
+          cache: true
+      - name: Install locked environment
+        run: pixi install --locked
+      - name: Run viewer tests
+        run: pixi run test

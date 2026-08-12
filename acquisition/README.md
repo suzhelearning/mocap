@@ -39,7 +39,7 @@ acquisition/
 │   └── e2e_check.py                # 端到端验证:按键录制 → HDF5 → inspect 校验
 ├── src/acquisition/       # 包:config/kinematics/stitching/manus_schema/
 │                          #     streams/recorder/keyboard/state_machine/live_view/cli
-└── tests/                 # 69 项:单测 + zenoh 集成 + HDF5 往返 + pty 键盘
+└── tests/                 # 单测 + zenoh 集成 + HDF5 往返/质量门 + pty 键盘
 ```
 
 ## 快速开始(本机验证,需真实设备流)
@@ -114,43 +114,74 @@ bash ../record.sh
 2. 静止站立,记录手腕实际位置,反推 `wrist_offset.xyz`
 3. 开 live 视图看手指方向:上/下颠倒改 `signs`,左/右颠倒改 `permutation`
 
-## HDF5 文件结构
+## HDF5 文件结构（schema 2.0）
 
 ```
-/                 attrs: take_id, start/end_wall_ns, config_yaml(全文), keymap, 轴变换
-/mocap            frame_number, motive_timestamp, publisher_received_time_ns,
-                  t_ubuntu_ns, publisher_dropped_frames,
-                  rigid_bodies/{ids,positions,quaternions_xyzw,tracking_valid,mean_error}(vlen)
-                  markers/{positions,raw_ids,occluded,id_kinds}(vlen, 可关)
+/ attrs: h5_version=2.0, schema_layout=offsets-flat-v2, take_id,
+          start/end_wall_ns, config_yaml/effective_config_yaml,
+          base_config_yaml, rigid_body_names_json, stream_health_json
+/mocap    frame_number, motive_timestamp, publisher_received_time_ns,
+          t_ubuntu_ns, t_aligned_ubuntu_ns, publisher_dropped_frames
+          rigid_bodies/{frame_offsets,ids,positions,quaternions_xyzw,
+                        tracking_valid,mean_error}
+          markers/{frame_offsets,positions,raw_ids,occluded,id_kinds}（可关）
 /hands/{left,right}  t_ubuntu_ns, seq, nodes_raw(25,3), wrist_position,
-                  wrist_quaternion_xyzw, nodes_global(25,3)
-/objects/{name}   t_ubuntu_ns, position, quaternion_xyzw, tracking_valid
-/events           t_ubuntu_ns, type(0=start..5=quit), note
+                     wrist_quaternion_xyzw, nodes_global(25,3), edges_json,
+                     mano_skeleton(21,3), mano_beta(10,)
+/objects/{name}      t_ubuntu_ns, position, quaternion_xyzw, tracking_valid
+/events              t_ubuntu_ns, type(0=start..5=quit), note
 ```
 
-时间基准:各流独立 `t_ubuntu_ns`(接收端墙钟)。手部 120Hz 与动捕 120Hz 帧率不同,
-回放时插值对齐(`replay_hdf5.py`)。markers 每帧数量可变,用 h5py vlen 存储。
+`frame_offsets[i:i+2]` 指向第 `i` 帧在 flat 数组中的半开区间；所有 flat 字段的长度必须
+等于 `frame_offsets[-1]`。格式契约、dtype、v1 兼容说明见
+[`docs/HDF5_SCHEMA.md`](docs/HDF5_SCHEMA.md)。
 
-## 已验证(2026-08-07,真实环境)
+时间基准：`t_ubuntu_ns` 是采集端接收时间；mocap 另保留
+`t_aligned_ubuntu_ns` 作为跨机时钟校正后的对齐轴。手部与动捕帧率不同，回放时按目标轴
+插值（位置 lerp + 四元数 slerp）。`inspect --strict` 会检查 offsets/flat、时间、频率、
+拓扑和拼接一致性。
 
-- **单元/集成测试**:47 项全绿(config 校验、拼接数值示例、消息解析、StreamHub 经
-  zenohd 收发、HDF5 写读往返、状态机全转移、pty 键盘)
-- **端到端**:真实动捕流(120.2Hz,刚体 1/2/3)+ 手部流(29.7Hz)→ 按键录制 →
-  HDF5 时间戳单调、无大间隙、`nodes_global[0] ≡ wrist_position`(误差 <1e-6)、
-  objects 子表与 events 完整、edges 拓扑落盘
-- **保存/丢弃**:S 原子改名留存,D 删除无残留;录制中 Q 先丢弃再退出
-- **可视化**:Viser 8081 正常启动;非终端 stdin 降级为阻塞读不崩溃
+**MANO 网格回放**：录制完成后可离线估计每只手形状参数并写回 HDF5：
+
+```bash
+pixi run mano-beta -- /home/current/data/20260812        # 单日目录（递归）
+```
+
+写回 `hands/<side>/mano_beta(10,)`；data-viewer（`./viewer.sh`）的 MANO 播放模式
+加载该参数驱动 MANO 网格，未写入时使用中性形状 β=0。
+
+## 已验证
+
+- **自动测试**：CI 与本地 `pixi run test` 覆盖 config、运动学、拼接、消息解析、
+  StreamHub、HDF5 往返/offsets-flat 质量门、状态机和 pty 键盘。
+- **端到端**：真实动捕流 + 手部流可按键录制；HDF5 检查器验证时间戳、帧间隙、
+  `nodes_global[0] ≡ wrist_position`、objects、events 和 edges。
+- **保存/丢弃**：S 原子留存、D 删除无残留；目标文件已存在时保存失败且不覆盖旧文件。
+- **可视化**：Viser 8081 正常启动；非终端 stdin 降级为阻塞读不崩溃。
+
+## CI 与发布质量门
+
+仓库级 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) 在 push/PR 上执行
+acquisition、natnet-zenoh 和 mocap-viewer 的锁定环境测试。采集文件交付前必须运行：
+
+```bash
+pixi run inspect -- --strict /path/to/take.h5
+```
+
+退出码非 0 的文件不得进入数据集；格式契约和兼容策略见
+[`docs/HDF5_SCHEMA.md`](docs/HDF5_SCHEMA.md)。
 
 ## 已知局限
 
-- 手腕朝向继承背部刚体(无法测真实腕转)→ 升级路径:建手腕刚体走 `wrist_rigid_id`
-- 跨机时钟未同步:Motive 原始时间戳留底,采集端统一打 `t_ubuntu_ns`,段级线性校正留作后续
-- 本机 zenohd(custom build)对「关闭 scouting 的 peer → router」连接不路由数据;
-  本程序与测试统一用 **client 模式**连 router;Windows publisher 若遇此问题需改
-  client 模式(见 `../natnet` 项目)
+- 手腕朝向继承背部刚体（无法测真实腕转）→ 升级路径：建手腕刚体走 `wrist_rigid_id`。
+- 跨机没有共享硬件时钟；采集端用 publisher 时间戳在线估计 offset/drift，并把质量
+  写入 `stream_health_json`，原始时间戳仍保留供离线复核。
+- 本机 zenohd(custom build)对「关闭 scouting 的 peer → router」连接不路由数据；
+  本程序与测试统一用 **client 模式**连 router；Windows publisher 若遇此问题需改
+  client 模式（见 `../natnet` 项目）。
 
 ## 测试
 
 ```bash
-pixi run test          # 47 项:config/运动学/拼接/解析/流订阅/录制往返/状态机/键盘
+pixi run test          # acquisition 全部单元/集成测试
 ```

@@ -11,7 +11,6 @@ import pytest
 from acquisition.manus_schema import (
     MEDIAPIPE_FROM_MANUS,
     ManusError,
-    decode_mano,
     decode_manus,
     manus_to_mediapipe,
     palm_node_index,
@@ -152,24 +151,3 @@ def test_manus_to_mediapipe_short_input_padded():
     assert kp[4] == [0.0, 0.0, 0.0]         # idx24 缺失 → 补零
 
 
-def test_decode_mano_valid():
-    """mano_skeleton 消息解析:21×3 keypoints。"""
-    kp = [[float(i), 0.0, 0.0] for i in range(21)]
-    msg = decode_mano(json.dumps({"glove_id": "a", "side": "left", "seq": 7,
-                                  "keypoints": kp}))
-    assert len(msg["keypoints"]) == 21
-    assert msg["keypoints"][20] == [20.0, 0.0, 0.0]
-
-
-def test_decode_mano_bad_shape():
-    with pytest.raises(ManusError, match="21×3"):
-        decode_mano(json.dumps({"keypoints": [[0.0, 0.0, 0.0]] * 20}))
-    with pytest.raises(ManusError, match="21×3"):
-        decode_mano(json.dumps({"keypoints": [[0.0, 0.0] for _ in range(21)]}))
-
-
-def test_decode_mano_rejects_non_finite():
-    kp = [[0.0, 0.0, 0.0] for _ in range(21)]
-    kp[0][0] = float("nan")
-    with pytest.raises(ManusError, match="非有限"):
-        decode_mano(json.dumps({"keypoints": kp}))

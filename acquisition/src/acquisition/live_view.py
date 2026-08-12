@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import viser
+import socket
 
 from .config import Config
 from .kinematics import quat_xyzw_to_wxyz
@@ -178,6 +179,14 @@ class StitchedScene:
         """
         self._cfg = config
         self._port = port or config.viz_port
+        # 固定端口:冲突直接报错(viser 内部端口被占会静默 +1,采集页地址会漂移)
+        with socket.socket() as _probe:
+            try:
+                _probe.bind((host, self._port))
+            except OSError:
+                raise RuntimeError(
+                    f"viz 端口 {self._port} 已被占用,请先释放: ss -ltnp | grep {self._port}"
+                )
         self._on_command = on_command or (lambda ch: None)
         self._on_freq = on_freq or (lambda hz: None)
         self._on_object = on_object or (lambda name: None)
@@ -214,6 +223,8 @@ class StitchedScene:
             "左手", initial_value="左手 0.0Hz", disabled=True, order=3)
         self.status_rate_right = self.server.gui.add_text(
             "右手", initial_value="右手 0.0Hz", disabled=True, order=4)
+        self.status_health = self.server.gui.add_text(
+            "流健康", initial_value="异常/缺帧 0", disabled=True, order=5)
         self._build_controls()
 
         self._back = self.server.scene.add_frame("/rigid/back", wxyz=(1, 0, 0, 0),
@@ -302,7 +313,7 @@ class StitchedScene:
                 "丢弃", color=(214, 39, 40), hint=f"键盘键 {keymap['discard']!r}")
             default_freq = str(int(self._cfg.sample_hz))
             if default_freq not in FREQ_OPTIONS:
-                default_freq = "100"
+                default_freq = "60"
             self._freq = self.server.gui.add_dropdown(
                 "采集频率 (Hz)", FREQ_OPTIONS, initial_value=default_freq,
                 hint="录制落盘目标频率(输入流 120Hz 时下采样)")
@@ -599,6 +610,7 @@ class StitchedScene:
             self.status_rate_mocap.value = status.get("rate_mocap", "")
             self.status_rate_left.value = status.get("rate_left", "")
             self.status_rate_right.value = status.get("rate_right", "")
+            self.status_health.value = status.get("health", "")
 
     def stop(self) -> None:
         try:

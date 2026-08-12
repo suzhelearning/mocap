@@ -27,11 +27,11 @@ def test_120hz_stream_downsampled_to_100hz():
 
 
 def test_100hz_stream_passes_unchanged():
-    """100Hz 输入流 + 100Hz 目标 → 全部写入(仅首帧 t=0 因窗口边界丢弃)。"""
+    """100Hz 输入流 + 100Hz 目标 → 首帧起全部写入。"""
     gate = RateGate(100.0)
     ticks = _ticks(100.0, 5.0)
     written = _stream(ticks, gate)
-    assert len(written) == len(ticks) - 1
+    assert len(written) == len(ticks)
 
 
 def test_change_freq_takes_effect_immediately():
@@ -46,11 +46,11 @@ def test_change_freq_takes_effect_immediately():
 
 
 def test_low_rate_stream_never_dropped():
-    """30Hz 输入流 + 100Hz 目标 → 帧间隔(33ms)本就超过目标周期(10ms),不丢帧。"""
+    """30Hz 输入流 + 100Hz 目标 → 全部写入。"""
     gate = RateGate(100.0)
     ticks = _ticks(30.0, 4.0)
     written = _stream(ticks, gate)
-    assert len(written) == len(ticks) - 1   # 仅首帧 t=0 边界
+    assert len(written) == len(ticks)
 
 
 def test_dropped_frames_do_not_advance_window():
@@ -107,3 +107,29 @@ def test_default_stream_compat():
     t0 = 51_000_000
     assert gate.should_write(t0)
     assert not gate.should_write(t0 + int(1e9 / 100.0) // 2)
+
+
+def test_irregular_102hz_input_does_not_collapse_to_half_rate():
+    gate = RateGate(100.0)
+    pattern = (9_000_000, 10_300_000, 9_500_000, 10_180_000)
+    times = [0]
+    for index in range(1, 2300):
+        times.append(times[-1] + pattern[index % len(pattern)])
+    written = _stream(times, gate)
+    output_hz = (len(written) - 1) / ((times[-1] - times[0]) / 1e9)
+    assert output_hz == pytest.approx(100.0, abs=1.0)
+    assert len(written) / len(times) > 0.95
+
+
+def test_stats_distinguish_rate_limit_and_bad_timestamps():
+    gate = RateGate(100.0)
+    assert gate.should_write(1_000_000_000, stream="left")
+    assert not gate.should_write(1_005_000_000, stream="left")
+    assert not gate.should_write(1_005_000_000, stream="left")
+    stats = gate.stats()["streams"]["left"]
+    assert stats == {
+        "input": 3,
+        "kept": 1,
+        "rate_limited": 1,
+        "nonmonotonic": 1,
+    }

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Motion Archive</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand-lockup">
+        <div class="window-chrome" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <div class="brand-copy">
+          <span class="eyebrow">Local motion archive</span>
+          <h1 id="app-title">Motion Archive</h1>
+          <p id="status">Loading project...</p>
+        </div>
+      </div>
+
+      <div class="topbar-controls" role="group" aria-label="Playback display mode">
+        <span class="control-caption">Representation</span>
+        <button class="mode-button active" type="button" data-playback-mode="mano">MANO</button>
+        <button class="mode-button" type="button" data-playback-mode="keypoints">KEYPOINTS</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <div class="sidebar-heading">
+          <div>
+            <span class="eyebrow">Session index</span>
+            <h2>Recordings</h2>
+          </div>
+          <div class="count" id="sample-count">—</div>
+        </div>
+
+        <div class="filters">
+          <label class="sr-only" for="object-filter">Filter by object</label>
+          <select id="object-filter" aria-label="Filter by object"></select>
+          <label class="search-field">
+            <span class="search-mark" aria-hidden="true"></span>
+            <span class="sr-only">Search recordings</span>
+            <input id="search-input" placeholder="Find a recording" />
+          </label>
+        </div>
+
+        <div id="sample-list" class="sample-list"></div>
+
+        <div class="sidebar-footer">
+          <span>Local index</span>
+          <span class="footer-mark">HDF5 / VISER</span>
+        </div>
+      </aside>
+
+      <section class="content">
+        <div id="empty-state" class="empty-state">
+          <span class="eyebrow">Motion archive</span>
+          <strong>No recording selected.</strong>
+          <span>Choose a session from the index.</span>
+        </div>
+
+        <div id="detail" class="detail hidden">
+          <section class="sample-header">
+            <div>
+              <span class="eyebrow">Active session</span>
+              <h2 id="sample-title"></h2>
+              <p id="sample-path"></p>
+            </div>
+            <span class="header-mark">01</span>
+          </section>
+
+          <section class="viser-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Scene</span>
+                <div class="panel-title">3D playback</div>
+              </div>
+              <span class="panel-index">VISER</span>
+            </div>
+            <div id="viser-frame" class="viser-frame">
+              <div class="status-note">Select a recording to load playback.</div>
+            </div>
+          </section>
+
+          <section class="metadata-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Session detail</span>
+                <div class="panel-title">Metadata</div>
+              </div>
+              <span class="panel-index">INFO</span>
+            </div>
+            <div id="metadata" class="metadata-grid" aria-live="polite"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

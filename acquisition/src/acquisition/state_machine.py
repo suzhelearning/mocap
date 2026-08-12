@@ -18,6 +18,7 @@ finalize_save/discard 在离开时调用。
 from __future__ import annotations
 
 import enum
+from datetime import datetime
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -83,12 +84,13 @@ class TakeController:
         if self.state is not State.IDLE:
             return
         self.take_id += 1
-        # 输出结构:/<output_dir>/<日期>/<时间>.h5
-        # 例:/home/current/data/20260810/20260810_135931.h5
-        path = (self._take_dir / time.strftime("%Y%m%d")
-                / f"{time.strftime('%Y%m%d_%H%M%S')}.h5")
-        self.writer = self._writer_factory(self.take_id, path)
         self._start_ns = time.time_ns()
+        # 纳秒时间 + 进程内 take 序号，避免同秒多 take 文件名碰撞。
+        stamp = datetime.fromtimestamp(self._start_ns / 1e9).strftime(
+            "%Y%m%d_%H%M%S_%f")
+        path = (self._take_dir / stamp[:8]
+                / f"{stamp}_take{self.take_id:03d}.h5")
+        self.writer = self._writer_factory(self.take_id, path)
         self.writer.begin(self.take_id, self._start_ns)
         self.writer.append_event(EV_START, "start")
         self.state = State.RECORDING

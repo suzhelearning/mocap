@@ -1,0 +1,24 @@
+[workspace]
+name = "data-viewer"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[pypi-options]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+extra-index-urls = ["https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"]
+
+[tasks]
+test = "python -m unittest discover -s tests -v"
+serve = "data-viewer --host 127.0.0.1"
+
+[dependencies]
+python = "3.12.*"
+pip = "*"
+numpy = ">=1.26,<3"
+h5py = ">=3.11,<4"
+scipy = ">=1.18,<2"
+chumpy = ">=0.70,<0.71"
+
+[pypi-dependencies]
+data-viewer = { path = ".", editable = true }

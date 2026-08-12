@@ -49,7 +49,7 @@ axis_transform:                    # Manus 骨架(z-up) → Motive 系(y-up) 轴
 recording:
   output_dir: "/home/current/data"   # 数据根目录;录制自动建 <日期>/ 子目录,文件名=时间
   store_markers: true              # true=存原始 markers(vlen);false=只存刚体+手腕+手部
-  sample_hz: 100                   # 采集落盘目标频率(输入流 120Hz 时下采样;web 可动态改)
+  sample_hz: 60                    # 采集落盘目标频率(输入流 120Hz 时下采样;web 可动态改)
   chunk_frames: 4096               # HDF5 resize 批大小
 
 keys:

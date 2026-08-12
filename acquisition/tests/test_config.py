@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import yaml
 
 from acquisition.config import ConfigError, load_config
 
@@ -238,6 +239,12 @@ left:
     assert lo.yaw_deg == 8.2 and lo.pitch_deg == -5.1 and lo.roll_deg == 3.0
     # 未标定的 right 保持配置默认
     assert cfg.hands["right"].wrist_offset.xyz == (0.0, 0.0, 0.0)
+    # HDF5 必须保存合并后的实际配置，而非只保存 base config 原文。
+    effective = yaml.safe_load(cfg.config_text)
+    assert effective["hands"]["left"]["wrist_offset"]["xyz"] == [
+        0.021, -0.0125, 0.0148]
+    assert "xyz: [0, 0, 0]" in cfg.base_config_text
+    assert "yaw_deg: 8.2" in cfg.calibration_text
 
 
 def test_user_offset_ignored_when_user_missing(tmp_path):

@@ -26,9 +26,6 @@ MANUS_RAW_KEYS = ("manus/raw_skeleton/left_hand", "manus/raw_skeleton/right_hand
 MANUS_EDGE_KEYS = ("manus/skeleton_edges/left_hand", "manus/skeleton_edges/right_hand")
 MANUS_KEYS = MANUS_RAW_KEYS + MANUS_EDGE_KEYS
 
-# MANO/MediaPipe 21 点发布 topic(由 zenoh_pub 对同帧额外发布,原始 25 点保留)。
-# 顺序与 MANO FK 重排输出一致(manopth reorder),即 MediaPipe 约定。
-MEDIAPIPE_KEYS = ("manus/mano_skeleton/left_hand", "manus/mano_skeleton/right_hand")
 
 # MediaPipe 21 点 ← Manus 25 节点(数组索引 0-based;与 wuji-hand-teleop 的
 # _MEDIAPIPE_TO_MANUS 一致——wuji 的 node_id 为 1-based,此处已换算为数组索引)。
@@ -46,11 +43,10 @@ MEDIAPIPE_FROM_MANUS = (
 
 
 def manus_to_mediapipe(nodes) -> list:
-    """Manus 25 节点 → 21 点:仅按索引筛选,坐标不变(与 raw_skeleton 同一坐标系)。
+    """把已拼接的 Manus 25 节点筛选为本地可视化所需 21 点。
 
-    与 manus/zenoh_pub.py 的同名函数保持一致(发布端/消费端共用同一映射);
-    索引顺序同 wuji-hand-teleop 的 _MEDIAPIPE_TO_MANUS(即 MediaPipe/MANO FK
-    重排顺序),但不做 y 取反——保证 21 点与 25 点位置对齐。索引越界置 [0,0,0]。
+    只做索引重排，不再发布/订阅第二份 Zenoh 数据。顺序同
+    wuji-hand-teleop 的 _MEDIAPIPE_TO_MANUS；缺失节点补零。
     """
     out = []
     for idx in MEDIAPIPE_FROM_MANUS:
@@ -59,25 +55,6 @@ def manus_to_mediapipe(nodes) -> list:
     return out
 
 
-def decode_mano(payload: bytes | str) -> dict:
-    """解码一条 manus/mano_skeleton 消息(21×3 keypoints,MANO/MediaPipe 顺序)。
-
-    返回 {glove_id, side, seq, keypoints: list[list[float]]}。失败抛 ManusError。
-    """
-    try:
-        text = payload.decode("utf-8") if isinstance(payload, bytes) else payload
-        msg = json.loads(text)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ManusError(f"mano JSON 解析失败: {exc}") from exc
-    kp = msg.get("keypoints")
-    if not (isinstance(kp, list) and len(kp) == 21
-            and all(isinstance(p, list) and len(p) == 3 for p in kp)):
-        raise ManusError("keypoints 须为 21×3 数组")
-    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
-               and math.isfinite(v) for p in kp for v in p):
-        raise ManusError("keypoints 含非数值或非有限值")
-    msg["keypoints"] = [[float(v) for v in p] for p in kp]
-    return msg
 
 # topic 后缀 → 内部 side(Hand/Left_Hand 统一为 left/right)
 _SIDE_ALIASES = {"left_hand": "left", "right_hand": "right",

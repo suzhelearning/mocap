@@ -1,15 +1,15 @@
 """HDF5 录制器(TakeWriter):一个 take 一个实例。
 
 设计:
-- append_* 只入内存缓冲(在 zenoh 回调/主线程调用,开销极小)
-- flush() 把缓冲批量写入 HDF5(在录制主循环周期性调用,避开回调线程)
-- 临时文件写入 output_dir/.tmp_<pid>/ 私有 0700 目录(随机名,防符号链接/预测攻击);
-  保存 = flush + os.replace 原子改名;丢弃 = close + unlink(不留任何数据)
+- append_* 只入内存缓冲；flush() 在录制主循环批量写入，避免阻塞 Zenoh 回调。
+- 临时文件位于 output_dir 下的私有 0700 目录；保存采用同文件系统 hard-link，
+  目标已存在时失败且不覆盖既有采集。
+- HDF5 schema 2.0 使用 offsets + flat 数组保存可变长度刚体/marker 帧，
+  避免 vlen 数组的跨语言读取和追加成本；inspect/replay 兼容旧 v1 文件。
 
-时间基准:全部用 t_ubuntu_ns(接收端墙钟)。mocap 帧自带 t_ubuntu_ns
-(StreamHub 打点);manus 帧同样。
-
-HDF5 schema 见计划文档;markers 每帧数量可变 → h5py.vlen_dtype 一维铺平。
+时间基准:
+- t_ubuntu_ns：采集端收到消息的 wall-clock；
+- t_aligned_ubuntu_ns：用 publisher_received_time_ns 在线估计跨机时钟后的 mocap 轴。
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import numpy as np
 from .config import Config
 from .rate import RateGate
 
-H5_VERSION = "1.0"
+H5_VERSION = "2.0"
 
 # events type 枚举(与 state_machine 对应)
 EV_START = 0
@@ -63,7 +63,28 @@ class TakeWriter:
         self._counts = {"mocap": 0, "left": 0, "right": 0}
         self._start_ns = 0
         self._ended = False
+        self._stream_health_json = "{}"
 
+
+    def _configured_rigid_body_names(self) -> dict[str, str]:
+        names: dict[str, str] = {}
+        if self._cfg.back_rigid_id is not None:
+            names[str(self._cfg.back_rigid_id)] = "back"
+        for name, rigid_id in self._cfg.objects.items():
+            names.setdefault(str(rigid_id), name)
+        for side, hand in self._cfg.hands.items():
+            rigid_id = (
+                hand.wrist_rigid_id
+                if hand.wrist_rigid_id is not None
+                else hand.back_rigid_id
+            )
+            if rigid_id is not None:
+                names.setdefault(
+                    str(rigid_id),
+                    f"{side}_wrist" if hand.wrist_rigid_id is not None
+                    else f"{side}_back",
+                )
+        return names
     # -- 生命周期 ---------------------------------------------------------
 
     def begin(self, take_id: int, start_wall_ns: int) -> None:
@@ -86,68 +107,44 @@ class TakeWriter:
         self._f = h5py.File(self._tmp_path, "w")
         f = self._f
         f.attrs["h5_version"] = H5_VERSION
+        f.attrs["schema_name"] = "mocap-acquisition"
+        f.attrs["schema_layout"] = "offsets-flat-v2"
         f.attrs["take_id"] = take_id
         f.attrs["start_wall_ns"] = start_wall_ns
+        # config_yaml 保持兼容名称，但语义改为“实际运行配置”。
         f.attrs["config_yaml"] = self._cfg.config_text
+        f.attrs["effective_config_yaml"] = self._cfg.config_text
+        f.attrs["base_config_yaml"] = self._cfg.base_config_text
+        if self._cfg.calibration_text:
+            f.attrs["calibration_yaml"] = self._cfg.calibration_text
         f.attrs["keymap"] = json.dumps(self._cfg.keymap, ensure_ascii=False)
         f.attrs["natnet_schema_version"] = 1
         f.attrs["axis_permutation"] = list(self._cfg.axis_permutation)
         f.attrs["axis_signs"] = list(self._cfg.axis_signs)
+        f.attrs["rigid_body_names_json"] = json.dumps(
+            self._configured_rigid_body_names(),
+            ensure_ascii=False, sort_keys=True)
 
-        mocap = f.create_group("mocap")
-        mocap.attrs["coordinate_system"] = "motive_y_up_right_handed"
-        mocap.attrs["unit"] = "meter"
-        for name, dt in (
-            ("frame_number", np.int64),
-            ("motive_timestamp", np.float64),
-            ("publisher_received_time_ns", np.int64),
-            ("t_ubuntu_ns", np.int64),
-            ("publisher_dropped_frames", np.int32),
-        ):
-            mocap.create_dataset(name, (0,), maxshape=(None,), dtype=dt, chunks=(4096,))
-        rb = mocap.create_group("rigid_bodies")
-        for name, dt in (
-            ("ids", np.int32),
-            ("positions", np.float32),
-            ("quaternions_xyzw", np.float32),
-            ("tracking_valid", np.uint8),
-            ("mean_error", np.float32),
-        ):
-            rb.create_dataset(
-                name, (0,), maxshape=(None,),
-                dtype=h5py.vlen_dtype(dt), chunks=(4096,),
-            )
-        if self._cfg.store_markers:
-            mk = mocap.create_group("markers")
-            for name, dt in (
-                ("positions", np.float32),
-                ("raw_ids", np.int32),
-                ("occluded", np.uint8),
-                ("id_kinds", np.uint8),
-            ):
-                mk.create_dataset(
-                    name, (0,), maxshape=(None,),
-                    dtype=h5py.vlen_dtype(dt), chunks=(4096,),
-                )
+        # 采集范围:仅双手 MANO + 指定物体刚体(命名 object),不保存 mocap 全量流。
+        # mocap 帧仍进入内存缓冲用于提取 objects 刚体,落盘不写 mocap/ 组。
 
         hands = f.create_group("hands")
         for side in ("left", "right"):
             g = hands.create_group(side)
-            g.attrs["node_count"] = 25
+            g.attrs["node_count"] = 21
             g.attrs["source"] = "manus"
             g.create_dataset("t_ubuntu_ns", (0,), maxshape=(None,), dtype=np.int64, chunks=(4096,))
             g.create_dataset("seq", (0,), maxshape=(None,), dtype=np.int64, chunks=(4096,))
-            g.create_dataset("nodes_raw", (0, 25, 3), maxshape=(None, 25, 3), dtype=np.float32, chunks=(1024, 25, 3))
+            g.create_dataset("mano_skeleton", (0, 21, 3), maxshape=(None, 21, 3), dtype=np.float32, chunks=(1024, 21, 3))
             g.create_dataset("wrist_position", (0, 3), maxshape=(None, 3), dtype=np.float32, chunks=(4096, 3))
             g.create_dataset("wrist_quaternion_xyzw", (0, 4), maxshape=(None, 4), dtype=np.float32, chunks=(4096, 4))
-            g.create_dataset("nodes_global", (0, 25, 3), maxshape=(None, 25, 3), dtype=np.float32, chunks=(1024, 25, 3))
 
         objs = f.create_group("objects")
         for name in self._cfg.objects:
             g = objs.create_group(name)
             g.create_dataset("t_ubuntu_ns", (0,), maxshape=(None,), dtype=np.int64, chunks=(4096,))
-            g.create_dataset("position", (0, 3), maxshape=(None, 3), dtype=np.float32, chunks=(4096, 3))
-            g.create_dataset("quaternion_xyzw", (0, 4), maxshape=(None, 4), dtype=np.float32, chunks=(4096, 4))
+            g.create_dataset("object_position", (0, 3), maxshape=(None, 3), dtype=np.float32, chunks=(4096, 3))
+            g.create_dataset("object_quaternion_xyzw", (0, 4), maxshape=(None, 4), dtype=np.float32, chunks=(4096, 4))
             g.create_dataset("tracking_valid", (0,), maxshape=(None,), dtype=np.uint8, chunks=(4096,))
 
         ev = f.create_group("events")
@@ -159,7 +156,8 @@ class TakeWriter:
 
     def append_mocap(self, frame: dict) -> None:
         """frame 须带 t_ubuntu_ns(StreamHub 已打点);按目标频率门控落盘。"""
-        if self._rate_gate is not None and not self._rate_gate.should_write(stream="mocap"):
+        if self._rate_gate is not None and not self._rate_gate.should_write(
+            int(frame["t_ubuntu_ns"]), stream="mocap"):
             return
         with self._lock:
             if self._f is not None and not self._ended:
@@ -172,14 +170,16 @@ class TakeWriter:
         msg: dict,
         wrist_pos: np.ndarray,
         wrist_quat_xyzw: np.ndarray,
-        nodes_global: np.ndarray,
+        mano_skeleton: np.ndarray,
     ) -> None:
         # 每路流独立 RateGate 窗口:三路流不共享节拍,各自达到目标频率
-        if self._rate_gate is not None and not self._rate_gate.should_write(stream=side):
+        if self._rate_gate is not None and not self._rate_gate.should_write(
+            int(msg["t_ubuntu_ns"]), stream=side):
             return
         with self._lock:
             if self._f is not None and not self._ended:
-                self._manus[side].append((msg, wrist_pos, wrist_quat_xyzw, nodes_global))
+                self._manus[side].append(
+                    (msg, wrist_pos, wrist_quat_xyzw, mano_skeleton))
                 self._counts[side] += 1
 
     def append_event(self, event_type: int, note: str = "") -> None:
@@ -214,13 +214,30 @@ class TakeWriter:
             events, self._events = self._events, []
 
         if mocap_buf:
-            self._flush_mocap(f, mocap_buf)
+            self._flush_objects(f, mocap_buf)
         for side, buf in manus_buf.items():
             if buf:
                 self._flush_manus(f, side, buf)
         if events:
             self._flush_events(f, events)
         f.flush()
+
+    def set_stream_health(self, health: dict[str, object]) -> None:
+        """保存本 take 截止当前的输入健康计数，finalize 时写入 attrs。"""
+        encoded = json.dumps(health, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            self._stream_health_json = encoded
+
+    def set_rigid_body_names(self, names: dict[int, str]) -> None:
+        """在保存前刷新运行时收到的 Motive 刚体名称表。"""
+        normalized = {
+            str(int(rigid_id)): str(name)
+            for rigid_id, name in names.items()
+        }
+        with self._lock:
+            if self._f is not None and not self._ended:
+                self._f.attrs["rigid_body_names_json"] = json.dumps(
+                    normalized, ensure_ascii=False, sort_keys=True)
 
     def finalize_save(self) -> None:
         """flush + 写收尾 attrs + 原子改名为正式文件名。
@@ -239,8 +256,12 @@ class TakeWriter:
                 return
             f, self._f = self._f, None
             f.attrs["end_wall_ns"] = time.time_ns()
+            f.attrs["stream_health_json"] = self._stream_health_json
         f.close()
-        os.replace(self._tmp_path, self._path)
+        # tmp 与正式文件位于同一文件系统；hard-link 创建是原子的，且目标
+        # 已存在时抛 FileExistsError，绝不覆盖既有采集数据。
+        os.link(self._tmp_path, self._path)
+        self._tmp_path.unlink()
         self._cleanup_tmp_dir()
 
     def discard(self) -> None:
@@ -270,78 +291,51 @@ class TakeWriter:
 
     # -- 内部写入 ---------------------------------------------------------
 
-    def _flush_mocap(self, f: h5py.File, buf: list[dict]) -> None:
-        mocap = f["mocap"]
-        n = len(buf)
-        def grow(ds, extra):
-            ds.resize(ds.shape[0] + extra, axis=0)
-        grow(mocap["frame_number"], n)
-        grow(mocap["motive_timestamp"], n)
-        grow(mocap["publisher_received_time_ns"], n)
-        grow(mocap["t_ubuntu_ns"], n)
-        grow(mocap["publisher_dropped_frames"], n)
-        base = mocap["t_ubuntu_ns"].shape[0] - n
-        mocap["frame_number"][base:] = [fr["frame_number"] for fr in buf]
-        mocap["motive_timestamp"][base:] = [fr["motive_timestamp"] for fr in buf]
-        mocap["publisher_received_time_ns"][base:] = [fr["publisher_received_time_ns"] for fr in buf]
-        mocap["t_ubuntu_ns"][base:] = [fr["t_ubuntu_ns"] for fr in buf]
-        mocap["publisher_dropped_frames"][base:] = [fr["publisher_dropped_frames"] for fr in buf]
+    @staticmethod
+    def _append_ragged(
+        group: h5py.Group,
+        rows: dict[str, list[np.ndarray]],
+    ) -> None:
+        """追加一批 offsets+flat 可变长度帧。"""
+        frame_offsets = group["frame_offsets"]
+        frame_count = len(next(iter(rows.values())))
+        old_frame_count = frame_offsets.shape[0] - 1
+        flat_start = int(frame_offsets[-1])
+        lengths = np.asarray(
+            [len(row) for row in next(iter(rows.values()))],
+            dtype=np.int64,
+        )
+        flat_end = flat_start + int(lengths.sum())
+        frame_offsets.resize((old_frame_count + frame_count + 1,))
+        frame_offsets[old_frame_count + 1:] = (
+            flat_start + np.concatenate(([0], np.cumsum(lengths)))
+        )[1:]
 
-        rb = mocap["rigid_bodies"]
-        grow(rb["ids"], n)
-        grow(rb["positions"], n)
-        grow(rb["quaternions_xyzw"], n)
-        grow(rb["tracking_valid"], n)
-        grow(rb["mean_error"], n)
-        ids, pos, quat, valid, err = [], [], [], [], []
-        for fr in buf:
-            rbs = fr.get("rigid_bodies", [])
-            ids.append(np.asarray([r["id"] for r in rbs], dtype=np.int32))
-            pos.append(np.asarray([r["position"] for r in rbs], dtype=np.float32).ravel())
-            quat.append(np.asarray([r["quaternion_xyzw"] for r in rbs], dtype=np.float32).ravel())
-            valid.append(np.asarray([int(r["tracking_valid"]) for r in rbs], dtype=np.uint8))
-            err.append(np.asarray([r["mean_error"] for r in rbs], dtype=np.float32))
-        rb["ids"][base:] = ids
-        rb["positions"][base:] = pos
-        rb["quaternions_xyzw"][base:] = quat
-        rb["tracking_valid"][base:] = valid
-        rb["mean_error"][base:] = err
+        for name, values in rows.items():
+            dataset = group[name]
+            dataset.resize((flat_end, *dataset.shape[1:]))
+            if flat_end > flat_start:
+                dataset[flat_start:flat_end] = np.concatenate(values, axis=0)
 
-        if self._cfg.store_markers and "markers" in mocap:
-            mk = mocap["markers"]
-            grow(mk["positions"], n)
-            grow(mk["raw_ids"], n)
-            grow(mk["occluded"], n)
-            grow(mk["id_kinds"], n)
-            mk_pos, mk_ids, mk_occ, mk_kind = [], [], [], []
-            for fr in buf:
-                markers = fr.get("markers", [])
-                mk_pos.append(np.asarray([m["position"] for m in markers], dtype=np.float32).ravel())
-                mk_ids.append(np.asarray([m["raw_id"] for m in markers], dtype=np.int32))
-                mk_occ.append(np.asarray([int(m["occluded"]) for m in markers], dtype=np.uint8))
-                mk_kind.append(np.asarray([_KIND_INDEX[m["id_kind"]] for m in markers], dtype=np.uint8))
-            mk["positions"][base:] = mk_pos
-            mk["raw_ids"][base:] = mk_ids
-            mk["occluded"][base:] = mk_occ
-            mk["id_kinds"][base:] = mk_kind
-
-        # objects 便捷子表
+    def _flush_objects(self, f: h5py.File, buf: list[dict]) -> None:
+        """从 mocap 帧缓冲提取命名物体刚体写入 objects/(mocap 组不落盘)。"""
         objs = f["objects"]
         for name, oid in self._cfg.objects.items():
             g = objs[name]
             rows = [(i, fr) for i, fr in enumerate(buf) if any(r["id"] == oid for r in fr.get("rigid_bodies", []))]
             if not rows:
                 continue
+            grow = lambda ds, extra: ds.resize(ds.shape[0] + extra, axis=0)  # noqa: E731
             grow(g["t_ubuntu_ns"], len(rows))
-            grow(g["position"], len(rows))
-            grow(g["quaternion_xyzw"], len(rows))
+            grow(g["object_position"], len(rows))
+            grow(g["object_quaternion_xyzw"], len(rows))
             grow(g["tracking_valid"], len(rows))
             base_obj = g["t_ubuntu_ns"].shape[0] - len(rows)
             g["t_ubuntu_ns"][base_obj:] = [fr["t_ubuntu_ns"] for _, fr in rows]
             for k, (_, fr) in enumerate(rows):
                 rb_ = next(r for r in fr["rigid_bodies"] if r["id"] == oid)
-                g["position"][base_obj + k] = rb_["position"]
-                g["quaternion_xyzw"][base_obj + k] = rb_["quaternion_xyzw"]
+                g["object_position"][base_obj + k] = rb_["position"]
+                g["object_quaternion_xyzw"][base_obj + k] = rb_["quaternion_xyzw"]
                 g["tracking_valid"][base_obj + k] = int(rb_["tracking_valid"])
 
     def _flush_manus(self, f: h5py.File, side: str, buf: list) -> None:
@@ -349,19 +343,17 @@ class TakeWriter:
         n = len(buf)
         for ds in (g["t_ubuntu_ns"], g["seq"], g["wrist_position"], g["wrist_quaternion_xyzw"]):
             ds.resize(ds.shape[0] + n, axis=0)
-        g["nodes_raw"].resize(g["nodes_raw"].shape[0] + n, axis=0)
-        g["nodes_global"].resize(g["nodes_global"].shape[0] + n, axis=0)
+        g["mano_skeleton"].resize(g["mano_skeleton"].shape[0] + n, axis=0)
         base = g["t_ubuntu_ns"].shape[0] - n
-        for k, (msg, wrist_pos, wrist_quat, nodes_global) in enumerate(buf):
+        for k, (msg, wrist_pos, wrist_quat, mano_skeleton) in enumerate(buf):
             seq = msg.get("seq")
             if seq is None:          # 二进制模式等无 seq 来源时用 -1
                 seq = -1
             g["t_ubuntu_ns"][base + k] = msg["t_ubuntu_ns"]
             g["seq"][base + k] = seq
-            g["nodes_raw"][base + k] = msg["nodes"]
+            g["mano_skeleton"][base + k] = mano_skeleton
             g["wrist_position"][base + k] = wrist_pos
             g["wrist_quaternion_xyzw"][base + k] = wrist_quat
-            g["nodes_global"][base + k] = nodes_global
 
     def _flush_events(self, f: h5py.File, buf: list) -> None:
         ev = f["events"]

@@ -1,120 +1,138 @@
 #!/usr/bin/env python3
-"""e2e_check.py — 端到端验证:真实流 → 按键录制 → HDF5 检查。
-
-流程(通过 pty 模拟按键):r 开始录制 → 等 REC seconds → s 保存 → q 退出,
-然后检查 captures/ 下生成的 HDF5 并跑 inspect。
-
-前置:zenohd 已在 7447 监听;有真实动捕流(Motive/Windows publisher)
-与 manus 流(Manus 手套发布)发布到 router(合成 demo 数据已移除)。
-
-用法: pixi run python scripts/e2e_check.py [--seconds 5]
-"""
+"""真实流 → 录制 → 新 HDF5 → 严格质量门的端到端检查。"""
 
 from __future__ import annotations
 
 import argparse
 import os
 import pty
-import re
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+from acquisition.config import load_config
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--seconds", type=float, default=5.0)
-    ap.add_argument("--no-viz", action="store_true", default=True)
-    args = ap.parse_args()
+def _captures(root: Path) -> set[Path]:
+    return {path.resolve() for path in root.rglob("*.h5")}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--seconds", type=float, default=5.0)
+    parser.add_argument("--viz", action="store_true",
+                        help="E2E 时也启动 Viser（默认纯采集）")
+    parser.add_argument("--min-rate-ratio", type=float, default=0.7)
+    parser.add_argument("--max-gap-ms", type=float, default=100.0)
+    args = parser.parse_args(argv)
+
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = (ROOT / config_path).resolve()
+    cfg = load_config(config_path)
+    output_dir = cfg.output_dir
+    before = _captures(output_dir) if output_dir.exists() else set()
+    started_ns = time.time_ns()
 
     master, slave = pty.openpty()
-    env = {**os.environ, "PYTHONPATH": "src"}
-    cmd = ["pixi", "run", "record", "--config", args.config]
-    if args.no_viz:
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+    cmd = [sys.executable, "-m", "acquisition.cli", "--config", str(config_path)]
+    if not args.viz:
         cmd.append("--no-viz")
     proc = subprocess.Popen(
-        cmd, cwd=ROOT, env=env,
-        stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cmd,
+        cwd=ROOT,
+        env=env,
+        stdin=slave,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
     )
     os.close(slave)
-
-    def send(ch: str) -> None:
-        os.write(master, ch.encode())
-        time.sleep(0.3)
-
     lines: list[str] = []
-    _reader_done = threading.Event()
 
-    def _reader() -> None:
-        """后台读 stdout:状态栏用 \\r 不换行,readline 会阻塞,必须独立线程。"""
+    def reader() -> None:
+        assert proc.stdout is not None
         for line in proc.stdout:
-            lines.append(line.rstrip())
-            print("  | " + line.rstrip(), flush=True)
-        _reader_done.set()
+            text = line.rstrip()
+            lines.append(text)
+            print("  | " + text, flush=True)
 
-    threading.Thread(target=_reader, daemon=True).start()
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
 
-    def pump(seconds: float) -> None:
-        time.sleep(seconds)
+    def send(key: str) -> None:
+        if proc.poll() is not None:
+            raise RuntimeError(f"record 提前退出，code={proc.returncode}")
+        os.write(master, key.encode())
+        time.sleep(0.4)
 
     try:
-        print("[e2e] 等待流进入…")
-        pump(3.0)
-        print("[e2e] 按 r 开始录制")
-        send("r")
-        pump(args.seconds)
-        print("[e2e] 按 s 保存")
-        send("s")
-        pump(1.5)
-        print("[e2e] 按 q 退出")
-        send("q")
-        pump(3.0)
+        print("[e2e] 等待真实流进入…")
+        time.sleep(3.0)
+        print("[e2e] 开始录制")
+        send(cfg.keymap["start"])
+        time.sleep(args.seconds)
+        print("[e2e] 保存")
+        send(cfg.keymap["save"])
+        time.sleep(1.0)
+        print("[e2e] 退出")
+        send(cfg.keymap["quit"])
         proc.wait(timeout=10)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
     finally:
         os.close(master)
         if proc.poll() is None:
-            proc.kill()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        reader_thread.join(timeout=2)
 
-    out = "\n".join(lines)
-    if "已连接" not in out:
-        print("[FAIL] record 未成功连接 router", file=sys.stderr)
+    output = "\n".join(lines)
+    if proc.returncode != 0 or "[saved]" not in output:
+        print("[FAIL] record 未完成保存状态转移", file=sys.stderr)
         return 1
 
-# 输出目录来自配置(output_dir/<日期>/*.h5),非写死 captures/
-    try:
-        from acquisition.config import load_config
-        cfg_dir = load_config(ROOT / "config.yaml").output_dir
-    except Exception:
-        cfg_dir = ROOT / "captures"
-    h5s = sorted(cfg_dir.rglob("*.h5"))
-    if not h5s:
-        print("[FAIL] 未生成 HDF5 文件", file=sys.stderr)
-        return 1
-    h5 = h5s[-1]
-    print(f"[e2e] 生成: {h5}")
-
-    # inspect 输出校验
-    result = subprocess.run(
-        ["pixi", "run", "inspect", "--", str(h5)],
-        cwd=ROOT, env=env, capture_output=True, text=True,
+    after = _captures(output_dir)
+    new_files = sorted(
+        path for path in after - before
+        if path.stat().st_mtime_ns >= started_ns
     )
-    print(result.stdout)
-    if result.returncode != 0:
-        print("[FAIL] inspect 失败", file=sys.stderr)
+    if len(new_files) != 1:
+        print(
+            f"[FAIL] 本次应生成且只生成 1 个 HDF5，实际 {len(new_files)}:"
+            f" {new_files}",
+            file=sys.stderr,
+        )
         return 1
-    if "最大误差" in result.stdout:
-        m = re.search(r"最大误差: ([0-9.e+-]+) m", result.stdout)
-        if m and float(m.group(1)) > 1e-3:
-            print(f"[FAIL] 手腕拼接一致性误差过大: {m.group(1)}", file=sys.stderr)
-            return 1
-    if "Hz(实测)" not in result.stdout:
-        print("[FAIL] 时间戳统计缺失", file=sys.stderr)
+    capture = new_files[0]
+    print(f"[e2e] 本次生成: {capture}")
+
+    inspect_cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "inspect_hdf5.py"),
+        "--strict",
+        "--min-rate-ratio", str(args.min_rate_ratio),
+        "--max-gap-ms", str(args.max_gap_ms),
+        str(capture),
+    ]
+    result = subprocess.run(
+        inspect_cmd, cwd=ROOT, env=env, capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode != 0:
+        print("[FAIL] 新录制文件未通过严格质量门", file=sys.stderr)
         return 1
 
     print("[e2e] PASS")

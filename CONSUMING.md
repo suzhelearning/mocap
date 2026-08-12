@@ -16,7 +16,7 @@ natnet-zenoh publisher ── Zenoh TCP 7447 ──→  Ubuntu 数据服务（vi
 ```
 
 - **发布端**：Windows 上的 natnet-zenoh publisher（Motive 同机，loopback 收数据）
-- **手部数据**：`manus/raw_skeleton/{left,right}_hand`（原始 25 节点）+ `manus/mano_skeleton/{left,right}_hand`（MANO/MediaPipe 21 点，同帧同步发布）
+- **手部数据**：`manus/raw_skeleton/{left,right}_hand`（25 节点，MANO/MediaPipe 21 点在采集端由同一份全局骨架索引派生，不重复传输）
 - **数据通道**：有线直连 link-local（`169.254.1.0` ↔ `169.254.213.247`），TCP 7447，实测 ~0.3ms、120Hz、0 丢帧
 - **Zenoh 网络**：显式 TCP peer 连接；**必须先有人监听 7447（数据服务端），消费者再 connect 加入**
 - **服务端转发（relay）**：Zenoh 1.9 peer 只在直连对之间交换订阅路由，多跳转发不可靠。因此数据服务端（`view`）收到帧后会**重新发布到同一 key**（带 `relayed_by_mocap_viewer` 标记防回环），connect 模式的消费者相当于直连发布者，数据稳定可达。不需要转发时可加 `--no-relay`。

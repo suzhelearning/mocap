@@ -128,6 +128,9 @@ def test_multiple_takes_sequential(tmp_path):
     assert ctrl.take_id == 2
     assert writers[0].saved
     assert writers[1].begin_args[0] == 2
+    assert writers[0].path != writers[1].path
+    assert "_take001.h5" in writers[0].path.name
+    assert "_take002.h5" in writers[1].path.name
 
 
 def test_status_line(tmp_path):

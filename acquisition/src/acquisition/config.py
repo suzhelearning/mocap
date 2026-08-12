@@ -53,13 +53,15 @@ class Config:
     axis_signs: tuple[int, int, int]
     output_dir: Path
     store_markers: bool
-    sample_hz: float               # 采集落盘目标频率(输入 120Hz 时默认降到 100Hz)
+    sample_hz: float               # 采集落盘目标频率(输入 120Hz 时默认降到 60Hz)
     keymap: dict[str, str]
     viz_port: int
     chunk_frames: int
     config_path: Path
-    config_text: str                      # 原样保存进 HDF5 attrs,便于溯源
-    user: str = "default"          # 操作者:与 manus --user 一致,合并 offset/<user>.yaml
+    config_text: str                      # 合并用户 offset 后的实际运行配置
+    base_config_text: str                 # 用户配置文件原文
+    calibration_text: str = ""            # 实际合并的 offset/<user>.yaml 原文
+    user: str = "default"                 # 操作者:与 manus --user 一致
 
     def axis_matrix(self) -> np.ndarray:
         """骨架系 → Motive 系的 3×3 轴变换矩阵。(A·d)_j = signs[j]·d[permutation[j]]"""
@@ -190,7 +192,7 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError("recording 必须是映射")
     output_dir = Path(rec.get("output_dir", "captures"))
     store_markers = bool(rec.get("store_markers", True))
-    sample_hz = float(rec.get("sample_hz", 100.0))
+    sample_hz = float(rec.get("sample_hz", 60.0))
     if not (sample_hz > 0 and sample_hz <= 10000):
         raise ConfigError(f"recording.sample_hz 必须是正数,实际 {sample_hz}")
     chunk_frames = int(rec.get("chunk_frames", 4096))
@@ -209,6 +211,7 @@ def load_config(path: str | Path) -> Config:
 
     user = str(raw.get("user", "default"))
 
+    base_config_text = path.read_text(encoding="utf-8")
     cfg = Config(
         router_endpoint=str(router["endpoint"]),
         back_rigid_id=back_id,
@@ -224,42 +227,59 @@ def load_config(path: str | Path) -> Config:
         chunk_frames=chunk_frames,
         user=user,
         config_path=path.resolve(),
-        config_text=path.read_text(encoding="utf-8"),
+        config_text=base_config_text,
+        base_config_text=base_config_text,
     )
     # 合并按用户标定的 offset:offset/<user>.yaml 覆盖 hands.<side>.wrist_offset
     return _merge_user_offset(cfg)
 
 
-def _merge_user_offset(cfg: Config) -> Config:
-    """若 offset/<user>.yaml 存在,用其中 left/right 的标定覆盖对应 wrist_offset。
+def _effective_config_text(cfg: Config, hands: dict[str, HandConfig]) -> str:
+    """把用户 offset 合并进原配置，生成可独立复现的有效配置快照。"""
+    raw = yaml.safe_load(cfg.base_config_text)
+    for side, hand in hands.items():
+        offset = hand.wrist_offset
+        raw["hands"][side]["wrist_offset"] = {
+            "mode": offset.mode,
+            "xyz": list(offset.xyz),
+            "yaw_deg": offset.yaw_deg,
+            "pitch_deg": offset.pitch_deg,
+            "roll_deg": offset.roll_deg,
+        }
+    return yaml.safe_dump(raw, allow_unicode=True, sort_keys=False)
 
-    与 manus 的 --user 同一用户体系(如 syz/yq/shd):
-    标定脚本 calibrate_wrist_offset.py --user <名> 写入 acquisition/offset/<名>.yaml。
-    """
+
+def _merge_user_offset(cfg: Config) -> Config:
+    """用 offset/<user>.yaml 覆盖 wrist_offset，并保存有效配置快照。"""
     offset_path = cfg.config_path.parent / "offset" / f"{cfg.user}.yaml"
     if not offset_path.is_file():
         return cfg
     try:
-        raw = yaml.safe_load(offset_path.read_text(encoding="utf-8"))
+        calibration_text = offset_path.read_text(encoding="utf-8")
+        raw = yaml.safe_load(calibration_text)
     except (OSError, yaml.YAMLError):
         return cfg
     if not isinstance(raw, dict):
         return cfg
     hands = dict(cfg.hands)
+    applied = False
     for side in ("left", "right"):
-        o = raw.get(side)
-        if not isinstance(o, dict):
+        data = raw.get(side)
+        if not isinstance(data, dict):
             continue
         try:
-            offset = _parse_offset(o, f"offset/{cfg.user}.yaml.{side}")
+            offset = _parse_offset(data, f"offset/{cfg.user}.yaml.{side}")
         except ConfigError:
             continue
-        h = hands[side]
+        hand = hands[side]
         hands[side] = HandConfig(
-            side=h.side, back_rigid_id=h.back_rigid_id,
-            wrist_offset=offset, wrist_rigid_id=h.wrist_rigid_id,
+            side=hand.side,
+            back_rigid_id=hand.back_rigid_id,
+            wrist_offset=offset,
+            wrist_rigid_id=hand.wrist_rigid_id,
         )
-    if hands == cfg.hands:
+        applied = True
+    if not applied:
         return cfg
     return Config(
         router_endpoint=cfg.router_endpoint,
@@ -276,5 +296,7 @@ def _merge_user_offset(cfg: Config) -> Config:
         chunk_frames=cfg.chunk_frames,
         user=cfg.user,
         config_path=cfg.config_path,
-        config_text=cfg.config_text,
+        config_text=_effective_config_text(cfg, hands),
+        base_config_text=cfg.base_config_text,
+        calibration_text=calibration_text,
     )

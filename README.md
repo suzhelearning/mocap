@@ -86,6 +86,6 @@ web 左侧「录制控制」按钮与键盘(r/s/d)等价;「采集频率」下�
 ## 测试
 
 ```bash
-pixi run test                      # mocap: 29 项
-cd acquisition && pixi run test    # acquisition: 47 项(含真实 zenohd 集成)
+pixi run test                      # mocap viewer 测试
+cd acquisition && pixi run test    # acquisition 单元/集成与 HDF5 v2 质量测试
 ```

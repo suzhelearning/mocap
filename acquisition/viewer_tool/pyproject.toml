@@ -1,0 +1,21 @@
+[project]
+name = "data-viewer"
+version = "0.1.0"
+description = "Small reusable local viewer for viser playback and metadata."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "viser",
+]
+
+[project.scripts]
+data-viewer = "data_viewer.server:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+include = ["data_viewer*"]
+
+[tool.setuptools.package-data]
+data_viewer = ["static/*"]

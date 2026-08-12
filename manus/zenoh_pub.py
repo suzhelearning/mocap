@@ -4,7 +4,7 @@
 从 stdin 读取 rawviz 协议（HAND/EDGE/POS，左右手独立流），发布到 Zenoh：
 
   manus/raw_skeleton/<side>        每手套独立流:每帧 25 节点位置（JSON 或 --binary）
-  manus/skeleton_edges/<side>      骨骼连接（child,parent,chainType），一次性
+  manus/skeleton_edges/<side>      骨骼连接（child,parent,chainType），周期重发
 
 左右手完全解耦（类似 ROS 双 topic）:每只手独立 seq、独立发布,
 一只遮挡/无数据不影响另一只。
@@ -29,41 +29,13 @@ import zenoh
 MAX_NODE_COUNT = 64              # rawviz 上报节点数上限(正常 25),防畸形设备数据
 EDGE_REPUBLISH_PERIOD = 300      # 拓扑重发周期(seq 差值),让后启动的订阅者也能收到
 
-# MediaPipe 21 点 ← Manus 25 节点(数组索引 0-based;与 wuji-hand-teleop 的
-# _MEDIAPIPE_TO_MANUS 一致——wuji 的 node_id 为 1-based,此处已换算为数组索引)。
-# 真机布局:0=手掌 root;1-5/6-10/11-15/16-20 各指(掌骨起点,掌骨,MCP,PIP,TIP);
-# 21-24 拇指(4 节点)。MediaPipe: 0=WRIST, 1-4=THUMB, 5-8=INDEX, 9-12=MIDDLE,
-# 13-16=RING, 17-20=PINKY
-MEDIAPIPE_FROM_MANUS = (
-    0,                  # mp0  wrist  ← 索引 0(手掌 root)
-    21, 22, 23, 24,     # mp1-4 拇指
-    2, 3, 4, 5,         # mp5-8 食指(跳过掌骨起点 1)
-    7, 8, 9, 10,        # mp9-12 中指(跳过 6)
-    12, 13, 14, 15,     # mp13-16 无名指(跳过 11)
-    17, 18, 19, 20,     # mp17-20 小指(跳过 16)
-)
-
-
-def manus_to_mediapipe(nodes):
-    """Manus 25 节点 → 21 点:仅按索引筛选,坐标不变(与 raw_skeleton 同一坐标系,
-    保证 21 点与 25 点位置对齐)。
-
-    索引顺序与 wuji-hand-teleop 的 _MEDIAPIPE_TO_MANUS 一致(MediaPipe/MANO FK
-    重排顺序);wuji 的 y 取反是为其 MediaPipe 消费端约定,此处不做——
-    消费端需要时自行变换。索引越界/缺失节点置 [0,0,0]。
-    """
-    out = []
-    for idx in MEDIAPIPE_FROM_MANUS:
-        p = nodes[idx] if idx < len(nodes) else [0.0, 0.0, 0.0]
-        out.append([p[0], p[1], p[2]])
-    return out
 
 
 class ZenohPublisher:
     def __init__(self, binary=False):
         self.binary = binary
-        self.hands = {}                # gloveId -> {side, node_count, edges, last_seq}
-        self.edges_sent = set()
+        # gloveId -> {side,node_count,edges,last_seq,last_edges_seq}
+        self.hands = {}
 
     def put(self, session, key, obj):
         if self.binary and isinstance(obj, dict) and "nodes" in obj:
@@ -109,8 +81,13 @@ class ZenohPublisher:
                 side = "left_hand"
             elif side == "right":
                 side = "right_hand"
-            self.hands[gid] = {"side": side, "node_count": n,
-                               "edges": [], "last_seq": 0}
+            self.hands[gid] = {
+                "side": side,
+                "node_count": n,
+                "edges": [],
+                "last_seq": None,
+                "last_edges_seq": None,
+            }
 
         elif tag == "EDGE" and len(parts) == 5:
             h = self.hands.get(parts[1])
@@ -143,24 +120,16 @@ class ZenohPublisher:
                         "seq": seq,
                         "nodes": nodes,
                     })
-                    # MANO 兼容 21 点(新格式):保留原始 25 点之外另行发布。
-                    # key: manus/mano_skeleton/{left,right}_hand
-                    # 顺序 = MediaPipe 约定 = MANO FK 重排输出(manopth
-                    # reorder [0,13..16,1..3,17,4..6,18,10..12,19,7..9,20]):
-                    # 0=wrist, 1-4=thumb, 5-8=index, 9-12=middle, 13-16=ring, 17-20=pinky
-                    self.put(session, f"manus/mano_skeleton/{h['side']}", {
-                        "glove_id": gid,
-                        "side": h["side"],
-                        "seq": seq,
-                        "keypoints": manus_to_mediapipe(nodes),
-                    })
-                    # 拓扑重发:首见立即发;seq 回绕/rawviz 重启(seq 后退)立即发;
-                    # 否则每 ~EDGE_REPUBLISH_PERIOD 帧重发一次
-                    if gid not in self.edges_sent:
+                    # 拓扑重发:首帧立即发；seq 回绕/rawviz 重启立即发；
+                    # 后续按上一次“拓扑发送序号”计周期，不能用逐帧 last_seq。
+                    last_seq = h["last_seq"]
+                    last_edges_seq = h["last_edges_seq"]
+                    wrapped = last_seq is not None and seq < last_seq
+                    due = (last_edges_seq is None
+                           or seq - last_edges_seq >= EDGE_REPUBLISH_PERIOD)
+                    if wrapped or due:
                         self._send_edges(session, gid, h)
-                        self.edges_sent.add(gid)
-                    elif seq < h["last_seq"] or seq - h["last_seq"] >= EDGE_REPUBLISH_PERIOD:
-                        self._send_edges(session, gid, h)
+                        h["last_edges_seq"] = seq
                     h["last_seq"] = seq
 
 

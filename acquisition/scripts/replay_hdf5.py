@@ -69,7 +69,8 @@ def interpolate_hand(g: h5py.Group, t_target: np.ndarray) -> tuple[np.ndarray, n
     t = g["t_ubuntu_ns"][:].astype(np.float64)
     if t.size < 2:
         raise ValueError(f"hand 组仅 {t.size} 帧,不足 2 无法插值")
-    nodes = g["nodes_global"][:]
+    node_key = "mano_skeleton" if "mano_skeleton" in g else "nodes_global"
+    nodes = g[node_key][:]
     wpos = g["wrist_position"][:]
     wquat = g["wrist_quaternion_xyzw"][:]
 
@@ -95,6 +96,36 @@ def interpolate_hand(g: h5py.Group, t_target: np.ndarray) -> tuple[np.ndarray, n
     return out_nodes, out_wpos, out_wquat
 
 
+def interpolate_rigid(g: h5py.Group, t_target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """把命名物体刚体组插值到 t_target 时间轴(位置 lerp + 四元数 slerp)。
+
+    返回 (position (M,3), quaternion_xyzw (M,4))。帧数不足 2 时抛 ValueError。
+    """
+    t = g["t_ubuntu_ns"][:].astype(np.float64)
+    if t.size < 2:
+        raise ValueError(f"刚体组仅 {t.size} 帧,不足 2 无法插值")
+    pos_key = "object_position" if "object_position" in g else "position"
+    quat_key = "object_quaternion_xyzw" if "object_quaternion_xyzw" in g else "quaternion_xyzw"
+    pos = g[pos_key][:]
+    quat = g[quat_key][:]
+    out_pos = np.empty((len(t_target), 3), dtype=np.float64)
+    out_quat = np.empty((len(t_target), 4), dtype=np.float64)
+    for i, tt in enumerate(t_target):
+        j = int(np.searchsorted(t, tt))
+        j = min(max(j, 0), len(t) - 1)
+        j0, j1 = max(0, j - 1), min(len(t) - 1, j)
+        if j0 == j1:
+            out_pos[i] = pos[j0]
+            out_quat[i] = quat[j0]
+            continue
+        frac = (tt - t[j0]) / (t[j1] - t[j0])
+        out_pos[i] = (1 - frac) * pos[j0] + frac * pos[j1]
+        q0 = _quat_xyzw_to_wxyz(quat[j0])
+        q1 = _quat_xyzw_to_wxyz(quat[j1])
+        out_quat[i] = _quat_wxyz_to_xyzw(slerp(q0, q1, frac))
+    return out_pos, out_quat
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="HDF5 录制回放/插值校验")
     ap.add_argument("file", type=str)
@@ -105,7 +136,23 @@ def main() -> int:
 
     with h5py.File(args.file, "r") as f:
         reject_external_links(f)                  # 防恶意 HDF5 外部链接
-        t_mocap = f["mocap/t_ubuntu_ns"][:].astype(np.float64)
+        mocap = f.get("mocap")
+        if mocap is not None:
+            mocap_time_key = (
+                "t_aligned_ubuntu_ns"
+                if "t_aligned_ubuntu_ns" in mocap
+                else "t_ubuntu_ns"
+            )
+            t_ref = mocap[mocap_time_key][:].astype(np.float64)
+        elif "objects" in f and f["objects"]:
+            # 新 schema(双手 MANO + 物体)无 mocap 组:以物体刚体轴为参考
+            t_ref = next(iter(f["objects"].values()))["t_ubuntu_ns"][:].astype(np.float64)
+        elif "hands" in f and "left" in f["hands"]:
+            t_ref = f["hands"]["left"]["t_ubuntu_ns"][:].astype(np.float64)
+        else:
+            print("无可用参考时间轴(mocap/objects/hands)", file=sys.stderr)
+            return 1
+        t_mocap = t_ref
         if t_mocap.size < 2:
             print("mocap 帧不足,无法构建目标时间轴", file=sys.stderr)
             return 1
@@ -136,6 +183,17 @@ def main() -> int:
             print("双手均无数据,无可回放内容", file=sys.stderr)
             return 1
 
+        objects = {}
+        if "objects" in f:
+            for name, g in f["objects"].items():
+                try:
+                    opos, oquat = interpolate_rigid(g, t_target)
+                except ValueError as exc:
+                    print(f"  object/{name}: {exc},跳过", file=sys.stderr)
+                    continue
+                objects[name] = {"position": opos, "quaternion_xyzw": oquat}
+                print(f"  object/{name}: 插值 {n_target} 帧")
+
         if args.json:
             with open(args.json, "w") as out:
                 for i in range(n_target):
@@ -144,6 +202,9 @@ def main() -> int:
                         frame[f"{side}_wrist"] = h["wrist"][i].tolist()
                         frame[f"{side}_wrist_quat_xyzw"] = h["wrist_quat"][i].tolist()
                         frame[f"{side}_nodes"] = h["nodes_global"][i].tolist()
+                    for name, o in objects.items():
+                        frame[f"object_{name}_position"] = o["position"][i].tolist()
+                        frame[f"object_{name}_quat_xyzw"] = o["quaternion_xyzw"][i].tolist()
                     out.write(json.dumps(frame) + "\n")
             print(f"[json] 已写出 {args.json}")
     return 0
