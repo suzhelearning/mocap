@@ -65,15 +65,12 @@ class VizScene:
         self.mano_enabled = bool(mano_enabled)
         self.mano_error: str | None = None
         self._mano_layers: dict[str, object] = {}
-        self._mano_betas: dict[str, np.ndarray] = {}   # side -> beta (10,) 或 None
-        self._mano_fit_mesh = None
+        self._mano_betas: dict[str, np.ndarray] = {}
+        self._mano_mesh_from_skeleton = None
         self._mano_handles: dict[str, object] = {}
+        self._mano_joint_handles: dict[str, tuple[object, object]] = {}
+        self._mano_source: dict[str, str] = {}
         self._mano_last_idx: dict[str, int] = {}
-        self._mano_last_params: dict[str, np.ndarray] = {}
-        self._mano_generation = 0
-        self._mano_lock = threading.Condition()
-        self._mano_pending: dict[str, tuple[int, int, np.ndarray, np.ndarray | None]] = {}
-        self._mano_results: dict[str, tuple[int, int, np.ndarray, np.ndarray]] = {}
 
         self.server = ViserServer(host="127.0.0.1", port=port)
         self.server.gui.configure_theme(dark_mode=True)   # 黑色主题
@@ -95,11 +92,7 @@ class VizScene:
         self._anim_thread = threading.Thread(
             target=self._animate, name="viz-h5-anim", daemon=True,
         )
-        self._mano_thread = threading.Thread(
-            target=self._mano_worker, name="viz-h5-mano", daemon=True,
-        )
         self._anim_thread.start()
-        self._mano_thread.start()
 
     def _reset_camera(self, client: viser.ClientHandle) -> None:
         """连接回调:强制相机回到默认视角（y-up 世界,画面上下翻转）。"""
@@ -129,89 +122,52 @@ class VizScene:
         }
 
     def _ensure_mano_backend(self) -> None:
-        """按需加载 MANO 后端；普通骨架回放不依赖它。"""
-        if self._mano_fit_mesh is not None or self.mano_error is not None:
+        """按需加载 MANO；普通骨架回放不依赖模型资产。"""
+        if self._mano_mesh_from_skeleton is not None or self.mano_error is not None:
             return
         try:
-            from mano_fit import fit_mesh, load_mano
+            from mano_fit import load_mano, mesh_from_skeleton
 
-            self._mano_fit_mesh = fit_mesh
+            self._mano_mesh_from_skeleton = mesh_from_skeleton
             self._mano_layers = {
                 side: load_mano(side) for side in ("left", "right")
             }
         except Exception as exc:
             self.mano_error = f"{type(exc).__name__}: {exc}"
 
-    def _clear_mano_work(self) -> None:
-        with self._mano_lock:
-            self._mano_generation += 1
-            self._mano_pending.clear()
-            self._mano_results.clear()
-            self._mano_lock.notify_all()
-
-    def _mano_worker(self) -> None:
-        """后台拟合网格，避免数值优化阻塞骨架回放线程。"""
-        while True:
-            with self._mano_lock:
-                while not self._mano_pending:
-                    self._mano_lock.wait()
-                side = next(iter(self._mano_pending))
-                request = self._mano_pending.pop(side)
-            generation, index, obs, init = request
-            layer = self._mano_layers.get(side)
-            if layer is None or self._mano_fit_mesh is None:
+    def _update_mano_mesh(self, t_ns: float) -> None:
+        if not self._mano_handles or self._mano_mesh_from_skeleton is None:
+            return
+        for side, handle in self._mano_handles.items():
+            hand = self._data["hands"][side]
+            index = nearest_idx(hand["t"], t_ns)
+            skeleton = hand["nodes"][index]
+            visible = self.mano_enabled and bool(np.isfinite(skeleton).all())
+            handle.visible = visible
+            point_cloud, lines = self._mano_joint_handles[side]
+            point_cloud.visible = visible
+            lines.visible = visible
+            if not visible or self._mano_last_idx.get(side) == index:
                 continue
             try:
-                verts, _joints, params = self._mano_fit_mesh(
-                    layer, obs, beta=self._mano_betas.get(side), init=init, iters=3,
+                verts, points = self._mano_mesh_from_skeleton(
+                    self._mano_layers[side],
+                    skeleton,
+                    self._mano_betas[side],
                 )
+                handle.vertices = verts
+                point_cloud.points = points
+                parents = self._mano_layers[side].parents
+                lines.points = np.asarray([
+                    [points[joint], points[parent]]
+                    for joint, parent in enumerate(parents) if parent >= 0
+                ], dtype=np.float32)
+                self._mano_last_idx[side] = index
             except Exception as exc:
+                handle.visible = False
+                point_cloud.visible = False
+                lines.visible = False
                 self.mano_error = f"MANO {side}: {type(exc).__name__}: {exc}"
-                continue
-            with self._mano_lock:
-                if generation == self._mano_generation:
-                    self._mano_results[side] = (
-                        generation, index, verts, params,
-                    )
-
-    def _request_mano(self, side: str, index: int) -> None:
-        if not self.mano_enabled or side not in self._mano_handles:
-            return
-        hand = self._data["hands"][side]
-        generation = self._mano_generation
-        with self._mano_lock:
-            result = self._mano_results.get(side)
-            pending = self._mano_pending.get(side)
-            if result is not None and result[0] == generation and result[1] == index:
-                return
-            if pending is not None and pending[0] == generation and pending[1] == index:
-                return
-            init = self._mano_last_params.get(side)
-            self._mano_pending[side] = (
-                generation, index, np.asarray(hand["nodes"][index], dtype=np.float64).copy(),
-                None if init is None else init.copy(),
-            )
-            self._mano_lock.notify()
-
-    def _update_mano_mesh(self, t_ns: float) -> None:
-        if not self._mano_handles:
-            return
-        with self._mano_lock:
-            results = list(self._mano_results.items())
-            self._mano_results.clear()
-        for side, (_generation, index, verts, params) in results:
-            if side not in self._mano_handles:
-                continue
-            self._mano_handles[side].vertices = verts
-            self._mano_last_idx[side] = index
-            self._mano_last_params[side] = params
-        for side, handle in self._mano_handles.items():
-            handle.visible = self.mano_enabled
-            if not self.mano_enabled:
-                continue
-            index = nearest_idx(self._data["hands"][side]["t"], t_ns)
-            if self._mano_last_idx.get(side) != index:
-                self._request_mano(side, index)
 
     def set_mano_enabled(self, enabled: bool) -> None:
         self.mano_enabled = bool(enabled)
@@ -223,8 +179,10 @@ class VizScene:
             "available": bool(self._mano_handles),
             "enabled": bool(self.mano_enabled and self._mano_handles),
             "error": self.mano_error,
-            "beta_from_h5": {side: bool(b is not None)
-                             for side, b in self._mano_betas.items()},
+            "beta_from_h5": {
+                side: side in self._mano_betas for side in ("left", "right")
+            },
+            "source": dict(self._mano_source),
         }
 
     # ---- 数据加载(全部入内存;22s 录段仅数 MB) ----
@@ -238,7 +196,6 @@ class VizScene:
             self.error = f"{type(exc).__name__}: {exc}"
             return self.error
 
-        self._clear_mano_work()
         self._data = data
         self.path = path
         self.error = None
@@ -254,51 +211,79 @@ class VizScene:
     # ---- 场景节点(文件切换时整体重建) ----
     def _rebuild_scene(self) -> None:
         if self._scene_ready:
-            for h in self._scene_handles:
-                h.remove()
+            for handle in self._scene_handles:
+                handle.remove()
         self._mano_handles.clear()
+        self._mano_joint_handles.clear()
+        self._mano_source.clear()
         self._mano_last_idx.clear()
-        self._mano_last_params.clear()
         self._mano_betas.clear()
         self._ensure_mano_backend()
-        # 读取 H5 中离线写入的 beta(mano_beta.py);缺失则用 β=0
-        try:
-            with h5py.File(self.path, "r") as f:
-                reject_external_links(f)
-                for side in ("left", "right"):
-                    g = f.get("hands", {}).get(side)
-                    if g is not None and "mano_beta" in g:
-                        self._mano_betas[side] = np.asarray(
-                            g["mano_beta"][:], dtype=np.float64)
-        except Exception as exc:
-            self.mano_error = f"读取 mano_beta 失败: {exc}"
         self._scene_nodes = build_scene_nodes(self.server.scene, self._data)
         self._scene_handles = self._scene_nodes.handles
-        if self._mano_fit_mesh is not None:
+        if self._mano_mesh_from_skeleton is not None:
             for side in ("left", "right"):
                 hand = self._data["hands"][side]
-                if hand["nodes"].shape[1] != 21:
+                beta = hand["mano_beta"]
+                if beta is None or hand["nodes"].shape[1:] != (21, 3):
                     continue
+                valid_indices = np.flatnonzero(
+                    np.isfinite(hand["nodes"]).all(axis=(1, 2)),
+                )
+                if not valid_indices.size:
+                    continue
+                index = int(valid_indices[0])
                 try:
-                    beta = self._mano_betas.get(side, np.zeros(10, dtype=np.float64))
-                    verts, _joints, params = self._mano_fit_mesh(
-                        self._mano_layers[side], hand["nodes"][0],
-                        beta=beta, iters=0,
+                    verts, points = self._mano_mesh_from_skeleton(
+                        self._mano_layers[side],
+                        hand["nodes"][index],
+                        beta,
                     )
+                    self._mano_betas[side] = beta
+                    self._mano_source[side] = "h5-skeleton-direct"
                     mesh = self.server.scene.add_mesh_simple(
                         f"/world/mano/{side}",
                         vertices=verts,
                         faces=self._mano_layers[side].faces,
-                        color=(224, 154, 154) if side == "left" else (154, 178, 224),
+                        color=(
+                            (224, 154, 154) if side == "left"
+                            else (154, 178, 224)
+                        ),
                         opacity=0.62,
                         side="double",
                         material="standard",
                         visible=self.mano_enabled,
                     )
                     self._mano_handles[side] = mesh
-                    self._mano_last_idx[side] = -1
-                    self._mano_last_params[side] = params
+                    self._mano_last_idx[side] = index
                     self._scene_handles.append(mesh)
+
+                    parents = self._mano_layers[side].parents
+                    segments = np.asarray([
+                        [points[joint], points[parent]]
+                        for joint, parent in enumerate(parents) if parent >= 0
+                    ], dtype=np.float32)
+                    color = (
+                        (214, 39, 40) if side == "left" else (31, 119, 180)
+                    )
+                    point_cloud = self.server.scene.add_point_cloud(
+                        f"/world/mano/{side}/joints16",
+                        points=points,
+                        colors=np.tile(color, (16, 1)).astype(np.uint8),
+                        point_size=0.007,
+                        point_shape="circle",
+                        precision="float32",
+                        visible=self.mano_enabled,
+                    )
+                    lines = self.server.scene.add_line_segments(
+                        f"/world/mano/{side}/bones16",
+                        points=segments,
+                        colors=np.tile(color, (15, 2, 1)).astype(np.uint8),
+                        line_width=2.5,
+                        visible=self.mano_enabled,
+                    )
+                    self._mano_joint_handles[side] = (point_cloud, lines)
+                    self._scene_handles.extend((point_cloud, lines))
                 except Exception as exc:
                     self.mano_error = (
                         f"MANO {side}: {type(exc).__name__}: {exc}"
@@ -395,7 +380,7 @@ _PAGE_HTML = """<!DOCTYPE html>
 <div id="controls">
   <button id="playbtn">▶ 播放</button>
   <div id="speedwrap"><span>倍速</span><input id="speed" type="range" min="10" max="500" value="100" step="10"><span id="speedval">1.0x</span></div>
-  <label id="manowrap"><input id="manocheck" type="checkbox"> MANO网格</label>
+  <label id="manowrap"><input id="manocheck" type="checkbox"> <span id="manolabel">MANO网格</span></label>
   <input id="seekbar" type="range" min="0" max="1000" value="0" step="1">
   <span id="timeinfo">-- / --</span>
   <button id="resetbtn">重置视角</button>
@@ -454,6 +439,10 @@ async function pollState() {
   const mano = $('#manocheck');
   mano.disabled = !d.mano.available;
   mano.checked = d.mano.enabled;
+  const sources = Object.values(d.mano.source || {});
+  $('#manolabel').textContent = sources.includes('h5-skeleton-direct')
+    ? 'MANO网格 + 原始16关键点 (骨架直接驱动)'
+    : 'MANO网格';
   if (d.mano.error && !d.mano.available) {
     $('#status').textContent = 'MANO不可用: ' + d.mano.error;
   }

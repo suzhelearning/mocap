@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""mano_fit.py — 纯 numpy MANO 前向层 + 21 点拟合(方案 B,可视化辅助)。
+"""mano_fit.py — 纯 numpy MANO 前向层与关键点直接驱动表面。
 
-MANO 模型(/home/current/syz/mocap/assets/mano/MANO_{LEFT,RIGHT}.pkl):
-  输入: theta(45 手姿态轴角) + beta(10 形状) + root_orient(3) + trans(3)
-  输出: verts(778,3) 表面 + joints21(21,3)(MediaPipe 顺序,与 mano_skeleton 一致)
+MANO 模型输入仍是内部骨骼旋转，但调用方只需提供：
+  - ``mano_skeleton(21,3)``：MediaPipe 顺序的世界系关键点；
+  - ``beta(10)``：从最多 1000 帧稳健段长估计的一次性手形参数。
 
-拟合策略(可视化用,精度优先于速度):
-  - beta: 用前若干帧平均观测,固定 theta=0 优化 (root, trans, beta) 匹配 21 点
-  - theta: 逐帧高斯牛顿(数值雅可比批量前向),上一帧热启动
+表面驱动使用关键点构造确定性关节变换并执行 MANO blend-shape + LBS，
+不做逐帧数值拟合。显示的 16 个 MANO 关节直接取自 ``mano_skeleton``。
 """
 from __future__ import annotations
 
@@ -19,20 +18,41 @@ import numpy as np
 MANO_DIR = Path(__file__).resolve().parents[2] / "assets" / "mano"
 
 # ── MANO ↔ MediaPipe 关节映射 ─────────────────────────────────────────
-# MANO 原生 16 关节顺序(kintree 定义,非拇指在前):
+# MANO 的 J_regressor / kintree_table 只有 16 个运动学关节，顺序由
+# MANO_{LEFT,RIGHT}.pkl 的 kintree_table 固定为:
 #   0=wrist, 1-3=index, 4-6=middle, 7-9=pinky, 10-12=ring, 13-15=thumb
-# MediaPipe 21 点(与 H5 mano_skeleton 一致):
+# 采集文件的 mano_skeleton 是 MediaPipe 21 点:
 #   0=wrist, 1-4=thumb, 5-8=index, 9-12=middle, 13-16=ring, 17-20=pinky
-# 每指 = 3 关节 + 1 指尖顶点(tip 从该指末端关节的蒙皮区域选取)。
-# MANO 关节 j → MediaPipe 槽位:
+# 注意: MediaPipe 的 5 个 fingertip 不是 MANO 的 J_regressor 关节，
+# 而是由官方 MANO vertex_ids.py 指定的表面顶点补齐。
 _MANO_TO_MP = np.asarray(
     (0, 5, 6, 7, 9, 10, 11, 17, 18, 19, 13, 14, 15, 1, 2, 3),
     dtype=np.int64,
 )
-_MP_TIPS_JOINT = (3, 6, 9, 12, 15)   # MANO 各指链末端关节(index/middle/pinky/ring/thumb)
-# 每个 MANO 链末端关节 → 对应指尖顶点的 MediaPipe 槽位:
-#   mp4=thumb tip(链15), mp8=index tip(链3), mp12=middle tip(链6),
-#   mp16=ring tip(链12), mp20=pinky tip(链9)
+MANO_JOINT_NAMES = (
+    "wrist",
+    "index_mcp", "index_pip", "index_dip",
+    "middle_mcp", "middle_pip", "middle_dip",
+    "pinky_mcp", "pinky_pip", "pinky_dip",
+    "ring_mcp", "ring_pip", "ring_dip",
+    "thumb_cmc", "thumb_mcp", "thumb_ip",
+)
+
+
+def mano_joints16_from_joints21(joints21: np.ndarray) -> np.ndarray:
+    """MediaPipe 顺序的 21 点转为 MANO 原生 16 运动学关节顺序。"""
+    joints21 = np.asarray(joints21)
+    if joints21.ndim < 2 or joints21.shape[-2:] != (21, 3):
+        raise ValueError(
+            f"joints21 必须以 (21,3) 结尾，实际为 {joints21.shape}",
+        )
+    return joints21[..., _MANO_TO_MP, :]
+
+_MP_TIPS_JOINT = (3, 6, 9, 12, 15)   # index/middle/pinky/ring/thumb
+# 官方 smplx.vertex_ids['mano']，按 _MP_TIPS_JOINT 的顺序排列。
+# 不能用“候选蒙皮顶点最大投影”推断，middle/ring/pinky 会产生相邻
+# 顶点的 off-by-one，导致可视化尖端和采集 keypoint 不再是同一点。
+_MANO_TIP_VERTICES = (320, 443, 671, 554, 744)
 _MP_TIP_SLOT_FROM_CHAIN = {15: 4, 3: 8, 6: 12, 12: 16, 9: 20}
 _FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
 
@@ -65,32 +85,6 @@ def _rotation_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.eye(3) + K + (K @ K) * ((1.0 - c) / (s * s))
 
 
-def _matrix_to_axis_angle(R: np.ndarray) -> np.ndarray:
-    """旋转矩阵转轴角，覆盖零角和接近 π 的数值退化。"""
-    R = np.asarray(R, dtype=np.float64)
-    cos_angle = float(np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0))
-    angle = float(np.arccos(cos_angle))
-    if angle < 1e-7:
-        return 0.5 * np.asarray([
-            R[2, 1] - R[1, 2],
-            R[0, 2] - R[2, 0],
-            R[1, 0] - R[0, 1],
-        ])
-    if np.pi - angle < 1e-5:
-        diag = np.maximum((np.diag(R) + 1.0) * 0.5, 0.0)
-        axis = np.sqrt(diag)
-        k = int(np.argmax(axis))
-        for j in range(3):
-            if j != k and axis[k] > 1e-8:
-                axis[j] = (R[k, j] + R[j, k]) / (4.0 * axis[k])
-        axis /= max(np.linalg.norm(axis), 1e-10)
-        return axis * angle
-    axis = np.asarray([
-        R[2, 1] - R[1, 2],
-        R[0, 2] - R[2, 0],
-        R[1, 0] - R[0, 1],
-    ]) / (2.0 * np.sin(angle))
-    return axis * angle
 
 
 def _kabsch_rotation(A: np.ndarray, B: np.ndarray) -> np.ndarray:
@@ -104,56 +98,6 @@ def _kabsch_rotation(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return R
 
 
-def pose_from_skeleton(
-    layer: ManoLayer,
-    obs: np.ndarray,
-    beta: np.ndarray | None = None,
-) -> np.ndarray:
-    """从 MediaPipe 21 点快速构造 MANO 姿态初值。
-
-    只用骨骼方向估计局部旋转，不做数值优化；返回与 ``fit_frame`` 相同
-    的 52 维 ``(root, trans, theta, scale)``，适合实时网格预览。
-    """
-    obs = np.asarray(obs, dtype=np.float64)
-    if obs.shape != (21, 3):
-        raise ValueError(f"obs 必须是 (21,3),实际为 {obs.shape}")
-    beta = np.zeros(10, dtype=np.float64) if beta is None else np.asarray(beta)
-    _, rest_J = layer._shaped(beta)
-    mp = _MANO_TO_MP
-    # 掌平面锚点:四指 MCP(MANO 1/4/10/7 = index/middle/ring/pinky),避开拇指
-    palm_mano = np.asarray((1, 4, 10, 7), dtype=np.int64)
-    root_R = _kabsch_rotation(
-        rest_J[palm_mano] - rest_J[0],
-        obs[mp[palm_mano]] - obs[mp[0]],
-    )
-    global_R = np.tile(np.eye(3), (16, 1, 1))
-    global_R[0] = root_R
-    theta = np.zeros(45, dtype=np.float64)
-    ratios: list[float] = []
-    for j in range(1, 16):
-        parent = layer.parents[j]
-        children = np.flatnonzero(np.asarray(layer.parents) == j)
-        if children.size:
-            child = int(children[0])
-            rest_dir = rest_J[child] - rest_J[j]
-            obs_dir = obs[mp[child]] - obs[mp[j]]
-            local_rest = global_R[parent].T @ rest_dir
-            local_obs = global_R[parent].T @ obs_dir
-            local_R = _rotation_between(local_rest, local_obs)
-            global_R[j] = global_R[parent] @ local_R
-            theta[(j - 1) * 3:j * 3] = _matrix_to_axis_angle(local_R)
-        else:
-            global_R[j] = global_R[parent]
-        p_len = np.linalg.norm(rest_J[j] - rest_J[parent])
-        o_len = np.linalg.norm(obs[mp[j]] - obs[mp[parent]])
-        if p_len > 1e-6 and o_len > 1e-6:
-            ratios.append(float(o_len / p_len))
-    x = np.zeros(52, dtype=np.float64)
-    x[:3] = _matrix_to_axis_angle(root_R)
-    x[3:6] = obs[0] - rest_J[0]
-    x[6:51] = theta
-    x[51] = float(np.clip(np.median(ratios) if ratios else 1.0, 0.5, 3.0))
-    return x
 
 
 def _rodrigues(axis_angle: np.ndarray) -> np.ndarray:
@@ -194,21 +138,24 @@ class ManoLayer:
         kt = np.asarray(d["kintree_table"], dtype=np.int64)
         parents = kt[0].copy()
         parents[parents >= 2**31] = -1          # uint32 存的 -1 溢出还原
+        if kt.shape != (2, 16):
+            raise ValueError(
+                f"MANO kintree_table 必须是 (2,16),实际为 {kt.shape}",
+            )
         self.parents = parents.tolist()                                       # parent of joint i
         self.faces = np.asarray(d["f"], dtype=np.int64)                       # (1538,3)
-        rest_J = self.J_regressor @ self.v_template                           # (16,3)
-        # tips 顶点:每指末端关节蒙皮下,沿手指方向(末端关节→指尖)投影最远的顶点
-        tips = []
-        for j_end in _MP_TIPS_JOINT:
-            parent_j = self.parents[j_end]
-            direction = rest_J[j_end] - rest_J[parent_j]
-            direction = direction / np.linalg.norm(direction)
-            candidate = np.where(self.weights[:, j_end] > 0.05)[0]
-            if candidate.size < 5:
-                candidate = np.argsort(self.weights[:, j_end])[-20:]
-            proj = (self.v_template[candidate] - rest_J[j_end]) @ direction
-            tips.append(int(candidate[int(np.argmax(proj))]))
-        self.tips = tuple(tips)
+        rest_J = self.J_regressor @ self.v_template
+        if self.J_regressor.shape != (16, 778):
+            raise ValueError(
+                f"MANO J_regressor 必须是 (16,778),实际为 {self.J_regressor.shape}",
+            )
+        if self.weights.shape != (778, 16):
+            raise ValueError(
+                f"MANO weights 必须是 (778,16),实际为 {self.weights.shape}",
+            )
+        # MANO 原生只有 16 个 J_regressor 关节。MediaPipe 的 5 个
+        # fingertip 使用官方 MANO 顶点索引，不把相邻表面顶点误当成关节。
+        self.tips = _MANO_TIP_VERTICES
         self._rest_joints = rest_J
         self._rest_cache: np.ndarray | None = None
 
@@ -299,6 +246,87 @@ def load_mano(side: str) -> ManoLayer:
     return ManoLayer(MANO_DIR / f"MANO_{name}.pkl")
 
 
+def mesh_from_skeleton(
+    layer: ManoLayer,
+    skeleton: np.ndarray,
+    beta: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """用 MediaPipe 21 点和 beta 直接驱动 MANO 表面。
+
+    返回 ``(vertices(778,3), joints16(16,3))``。``joints16`` 是输入关键点
+    按 MANO 原生关节顺序的直接重排，不是模型回归结果。表面通过确定性的
+    目标骨架变换与 LBS 生成，不运行 IK/最小二乘等逐帧优化。
+    """
+    skeleton = np.asarray(skeleton, dtype=np.float64)
+    beta = np.asarray(beta, dtype=np.float64)
+    if skeleton.shape != (21, 3):
+        raise ValueError(
+            f"skeleton 必须是 (21,3)，实际为 {skeleton.shape}",
+        )
+    if beta.shape != (10,):
+        raise ValueError(f"beta 必须是 (10,)，实际为 {beta.shape}")
+    if not np.isfinite(skeleton).all() or not np.isfinite(beta).all():
+        raise ValueError("skeleton 或 beta 含 NaN/Inf")
+
+    shaped_verts, rest_joints = layer._shaped(beta)
+    target_joints = mano_joints16_from_joints21(skeleton)
+    parents = np.asarray(layer.parents, dtype=np.int64)
+
+    # wrist 朝向由四指 MCP 的掌面整体决定。
+    palm = np.asarray((1, 4, 10, 7), dtype=np.int64)
+    global_rot = np.tile(np.eye(3), (16, 1, 1))
+    global_rot[0] = _kabsch_rotation(
+        rest_joints[palm] - rest_joints[0],
+        target_joints[palm] - target_joints[0],
+    )
+
+    # 每个关节使用下一骨段方向确定弯曲；DIP 使用对应 fingertip 作为虚拟
+    # 子节点。绕骨轴的不可观测 twist 采用从父节点平行传递的最小旋转。
+    tip_vertex = dict(zip(_MP_TIPS_JOINT, _MANO_TIP_VERTICES))
+    for joint in range(1, 16):
+        children = np.flatnonzero(parents == joint)
+        if children.size:
+            child = int(children[0])
+            rest_direction = rest_joints[child] - rest_joints[joint]
+            target_direction = target_joints[child] - target_joints[joint]
+        else:
+            rest_direction = (
+                shaped_verts[tip_vertex[joint]] - rest_joints[joint]
+            )
+            target_direction = (
+                skeleton[_MP_TIP_SLOT_FROM_CHAIN[joint]]
+                - target_joints[joint]
+            )
+        parent = int(parents[joint])
+        transported = global_rot[parent] @ rest_direction
+        global_rot[joint] = (
+            _rotation_between(transported, target_direction)
+            @ global_rot[parent]
+        )
+
+    # MANO pose blend shapes 使用父节点局部旋转；目标骨架坐标直接作为每个
+    # 关节变换的平移锚点，因此无需另存 translation 或逐帧 scale。
+    local_rot = np.empty_like(global_rot)
+    local_rot[0] = global_rot[0]
+    for joint in range(1, 16):
+        parent = int(parents[joint])
+        local_rot[joint] = global_rot[parent].T @ global_rot[joint]
+    pose_feature = (local_rot[1:] - np.eye(3)).reshape(-1)
+    posed_verts = shaped_verts + np.einsum(
+        "vcp,p->vc", layer.posedirs, pose_feature,
+    )
+
+    transformed = (
+        np.einsum("imn,vn->ivm", global_rot, posed_verts)
+        - np.einsum(
+            "imn,in->im", global_rot, rest_joints,
+        )[:, None, :]
+        + target_joints[:, None, :]
+    )
+    vertices = np.einsum("vj,jvm->vm", layer.weights, transformed)
+    return vertices.astype(np.float32), target_joints.astype(np.float32)
+
+
 # 每指 4 段(MP 槽位对):wrist→MCP, MCP→PIP, PIP→DIP, DIP→tip
 _SEGMENT_PAIRS = np.asarray((
     (0, 1), (1, 2), (2, 3), (3, 4),        # thumb
@@ -385,133 +413,3 @@ def beta_segment_rms_mm(
     observed = _robust_segment_lengths(np.asarray(obs, dtype=np.float64))
     fitted = _model_segment_lengths(layer, np.asarray(beta, dtype=np.float64))
     return float(np.sqrt(np.mean((fitted - observed) ** 2)) * 1e3)
-
-
-def _procrustes_align(
-    layer: ManoLayer, obs: np.ndarray, beta: np.ndarray,
-) -> np.ndarray:
-    """闭式最优对齐(旋转+平移)作拟合初值:用模板 21 点(θ=0)对齐观测。"""
-    _, model21 = layer.forward(np.zeros(45), beta, np.zeros(3), np.zeros(3))
-    A = model21 - model21[0]                      # 以 wrist 为中心
-    B = obs - obs[0]
-    H = A.T @ B
-    U, _, Vt = np.linalg.svd(H)
-    R = Vt.T @ U.T
-    if np.linalg.det(R) < 0:
-        Vt[-1] *= -1
-        R = Vt.T @ U.T
-    # 轴角
-    angle = np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))
-    axis = np.array([
-        R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1],
-    ])
-    n = np.linalg.norm(axis)
-    if n > 1e-8:
-        axis = axis / n * angle
-    x = np.zeros(52)
-    x[:3] = axis
-    x[3:6] = obs[0] - model21[0]                  # wrist 是旋转中心,trans 直接对齐
-    # 全局缩放初值:观测/模型 中指长比例(以 wrist 为原点)
-    obs_len = np.linalg.norm(obs[12] - obs[0])
-    model_len = np.linalg.norm(model21[12] - model21[0])
-    x[51] = obs_len / model_len if model_len > 1e-6 else 1.0
-    return x
-
-
-def fit_frame(
-    layer: ManoLayer,
-    obs: np.ndarray,
-    beta: np.ndarray,
-    init: np.ndarray | None = None,
-    iters: int = 6,
-    lam: float = 1e-3,
-) -> np.ndarray:
-    """逐帧拟合:优化 x = (root_orient(3), trans(3), theta(45), scale(1)) 共 52 维。
-
-    高斯牛顿 + 数值雅可比(批量前向差分);init 为上一帧结果(热启动)。
-    scale 以 wrist 为原点的全局缩放,补偿模板手与真实手尺寸差(β=0 时)。
-    返回 x (52,)。观测 obs (21,3) 为 MediaPipe 顺序全局坐标。
-    """
-    obs = np.asarray(obs, dtype=np.float64)
-    if obs.shape != (21, 3):
-        raise ValueError(f"obs 必须是 (21,3),实际为 {obs.shape}")
-    if init is None:
-        x = pose_from_skeleton(layer, obs, beta)
-    else:
-        x = np.asarray(init, dtype=np.float64).copy()
-        if x.shape != (52,):
-            raise ValueError(f"init 必须是 (52,),实际为 {x.shape}")
-
-    # wrist 是采集链路中定义明确的根点，固定平移而不是让模型误差把腕点拉偏。
-    _, shaped_J = layer._shaped(np.asarray(beta, dtype=np.float64))
-    trans_fixed = obs[0] - shaped_J[0]
-    x[3:6] = trans_fixed
-    free = np.concatenate((np.arange(3), np.arange(6, 52)))  # root + theta + scale
-
-    def residuals(params: np.ndarray) -> np.ndarray:
-        root, theta, scale = params[:3], params[6:51], params[51]
-        _, J21 = layer.forward(theta, beta, root, trans_fixed)
-        J21 = J21[0] + scale * (J21 - J21[0])     # 以 wrist 为原点缩放
-        return (J21 - obs).ravel()
-
-    for _ in range(iters):
-        r = residuals(x)
-        # 数值雅可比:每行只扰动一个自由参数,避免批量扰动串列。
-        eps_rot = 1e-3
-        step = np.full(free.size, 1e-5)
-        step[:3] = eps_rot
-        step[-1] = 1e-4
-        x_batch = np.repeat(x[None], free.size + 1, axis=0)
-        x_batch[1:, free] += np.diag(step)
-        roots = x_batch[:, :3]
-        thetas = x_batch[:, 6:51]
-        scales = x_batch[:, 51:]
-        trans_batch = np.repeat(trans_fixed[None], free.size + 1, axis=0)
-        _, J21b = layer.forward(thetas, beta, roots, trans_batch)
-        J21b = J21b[:, 0:1] + scales[:, None] * (J21b - J21b[:, 0:1])
-        J = ((J21b[1:] - J21b[:1]).reshape(free.size, -1)
-             / step[:, None]).T
-        # 高斯牛顿: Δ = -(JᵀJ + λI)⁻¹ Jᵀr。
-        try:
-            A = J.T @ J + lam * np.eye(free.size)
-            delta_free = -np.linalg.solve(A, J.T @ r)
-        except np.linalg.LinAlgError:
-            break
-        delta = np.zeros(52)
-        delta[free] = delta_free
-        # 线搜索:只接受确实降低残差的更新。
-        alpha = 1.0
-        while alpha > 1e-4:
-            xn = x + alpha * delta
-            if np.linalg.norm(residuals(xn)) < np.linalg.norm(r):
-                break
-            alpha *= 0.5
-        if alpha <= 1e-4:
-            break
-        x = xn
-        x[3:6] = trans_fixed
-    return x
-
-
-def fit_mesh(
-    layer: ManoLayer,
-    obs: np.ndarray,
-    beta: np.ndarray | None = None,
-    init: np.ndarray | None = None,
-    iters: int = 3,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """拟合一帧并返回 ``(vertices, joints21, params)``。
-
-    ``params[51]`` 是以腕点为中心的全局尺寸补偿；顶点和 21 点均已应用
-    该补偿，且输出腕点与观测 ``obs[0]`` 重合。
-    """
-    beta_arr = np.zeros(10, dtype=np.float64) if beta is None else np.asarray(beta)
-    params = fit_frame(layer, obs, beta_arr, init=init, iters=iters)
-    verts, joints = layer.forward(
-        params[6:51], beta_arr, params[:3], params[3:6],
-    )
-    scale = params[51]
-    wrist = joints[0]
-    verts = wrist + scale * (verts - wrist)
-    joints = wrist + scale * (joints - wrist)
-    return verts.astype(np.float32), joints.astype(np.float32), params

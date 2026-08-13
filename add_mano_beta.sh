@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-# add_mano_beta.sh - 为采集录制补写 MANO 形状参数 beta(离线估计)。
+# add_mano_beta.sh - 从手部关键点估计并写入每只手的 MANO beta。
 #
-# 默认只处理【当前日期】目录(/home/current/data/YYYYMMDD)——每天采集完
-# 直接跑一次即可；显式传入文件夹则处理指定目录(递归)。
-# 默认均匀抽取整条录制中的 1000 帧，逐帧稳健估计；已有 beta 自动跳过，
-# --force 全部高精度重算。可用 SAMPLES 环境变量调整帧数。
+# 默认只处理【当前日期】目录(/home/current/data/YYYYMMDD)；显式传入文件夹
+# 则递归处理指定目录。beta 默认均匀抽取最多 1000 帧；不做逐帧姿态拟合。
 #
 # 用法:
 #   bash add_mano_beta.sh                    # 只处理今天
-#   bash add_mano_beta.sh /path/to/date-dir  # 处理指定日期/数据目录(递归)
-#   bash add_mano_beta.sh -f                 # 强制高精度重算今天
-#   SAMPLES=2000 bash add_mano_beta.sh -f    # 自定义均匀抽样帧数
+#   bash add_mano_beta.sh /path/to/date-dir  # 处理指定日期/数据目录
+#   bash add_mano_beta.sh -f                 # 强制重算今天
+#   SAMPLES=2000 bash add_mano_beta.sh -f
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACQ_DIR="$SCRIPT_DIR/acquisition"
@@ -45,6 +43,6 @@ fi
 
 
 echo "[add_mano_beta] 扫描 $TARGET 下的 .h5 录制"
-echo "[add_mano_beta] 稳健逐帧段长估计:最多 $SAMPLES 帧(已写 beta 自动跳过)"
+echo "[add_mano_beta] beta≤$SAMPLES 帧,表面由关键点直接驱动(无逐帧拟合)"
 cd "$ACQ_DIR"
 exec pixi run mano-beta -- "$TARGET" --samples "$SAMPLES" "${FORCE[@]}"

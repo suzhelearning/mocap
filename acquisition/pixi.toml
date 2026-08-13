@@ -11,7 +11,7 @@ record-noviz = "python -m acquisition.cli --no-viz"
 inspect = "python scripts/inspect_hdf5.py"
 replay = "python scripts/replay_hdf5.py"
 viz-h5 = "python scripts/viz_hdf5.py"   # 用法: pixi run viz-h5 -- <日期文件夹> [--port 8082]
-mano-beta = "python scripts/mano_beta.py"  # 用法: pixi run mano-beta -- <file.h5> [--force]
+mano-beta = "python scripts/mano_beta.py"  # 从至多1000帧关键点估计每只手 beta
 test = "pytest tests"
 start-router = "bash scripts/start_zenohd.sh"
 

@@ -44,6 +44,7 @@ from viser import ViserServer  # noqa: E402
 
 # 录制时间轴步长(帧):原始 ~100Hz 全量写入文件过大,隔帧采样 ~50Hz 已足够流畅
 RECORD_STEP = 2
+MANO_RECORDING_VERSION = 4
 
 
 class H5ViewerAdapter(ViewerAdapter):
@@ -100,17 +101,20 @@ class H5ViewerAdapter(ViewerAdapter):
                 reject_external_links(f)
                 data = extract_hdf5(f)
                 mano_sides = {}
-                hands = f.get("hands")
-                for side in ("left", "right"):
-                    group = hands.get(side) if hands is not None else None
-                    if group is None or "mano_beta" not in group:
-                        mano_sides[side] = {"available": False}
-                        continue
-                    beta = np.asarray(group["mano_beta"][:])
+                for side, hand in data["hands"].items():
+                    beta = hand["mano_beta"]
+                    available = (
+                        beta is not None
+                        and hand["nodes"].shape[1:] == (21, 3)
+                    )
                     mano_sides[side] = {
-                        "available": True,
-                        "shape": list(beta.shape),
-                        "beta": beta.reshape(-1).astype(float).tolist(),
+                        "available": available,
+                        "shape": None if beta is None else list(beta.shape),
+                        "beta": None if beta is None else beta.astype(float).tolist(),
+                        "source": (
+                            "h5-skeleton-direct" if available else "unavailable"
+                        ),
+                        "joints16": available,
                     }
             meta["scene"] = {
                 "rigid_body_ids": sorted(data["rb_ids"]),
@@ -153,8 +157,9 @@ class H5ViewerAdapter(ViewerAdapter):
         sample = self._sample_by_id(sample_id)
         if not sample.path.is_file():
             raise FileNotFoundError(sample.path)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        recording = cache_dir / (sample.path.stem + ".mano.viser")
+        recording = cache_dir / (
+            f"{sample.path.stem}.mano-v{MANO_RECORDING_VERSION}.viser"
+        )
         if not (recording.is_file()
                 and recording.stat().st_mtime >= sample.path.stat().st_mtime):
             recording.write_bytes(_record_h5(sample.path, mano=True))
@@ -179,32 +184,13 @@ class H5ViewerAdapter(ViewerAdapter):
         return any(part in hidden or part.endswith(".egg-info") for part in rel_parts)
 
 def _load_mano_backend():
-    """延迟加载 MANO，保证仅使用关键点模式时不读取模型资产。"""
-    from mano_fit import fit_mesh, load_mano
+    """延迟加载 MANO；每帧由原始关键点确定性蒙皮，不运行数值拟合。"""
+    from mano_fit import load_mano, mesh_from_skeleton
 
-    return fit_mesh, {side: load_mano(side) for side in ("left", "right")}
-
-
-def _load_mano_betas(path: Path) -> dict[str, np.ndarray]:
-    """读取 hands/<side>/mano_beta；缺失时使用 MANO 中性形状。"""
-    betas: dict[str, np.ndarray] = {}
-    with h5py.File(path, "r") as f:
-        reject_external_links(f)
-        hands = f.get("hands")
-        for side in ("left", "right"):
-            group = hands.get(side) if hands is not None else None
-            if group is None or "mano_beta" not in group:
-                betas[side] = np.zeros(10, dtype=np.float64)
-                continue
-            beta = np.asarray(group["mano_beta"][:], dtype=np.float64)
-            if beta.shape != (10,):
-                raise ValueError(
-                    f"hands/{side}/mano_beta 必须是 (10,),实际为 {beta.shape}",
-                )
-            if not np.isfinite(beta).all():
-                raise ValueError(f"hands/{side}/mano_beta 含非有限值")
-            betas[side] = beta
-    return betas
+    return (
+        mesh_from_skeleton,
+        {side: load_mano(side) for side in ("left", "right")},
+    )
 
 
 def _record_h5(path: Path, *, mano: bool = False) -> bytes:
@@ -213,38 +199,46 @@ def _record_h5(path: Path, *, mano: bool = False) -> bytes:
         reject_external_links(f)
         data = extract_hdf5(f)
 
-    fit_mesh = None
+    mesh_from_skeleton = None
     mano_layers: dict[str, object] = {}
-    mano_betas: dict[str, np.ndarray] = {}
     if mano:
-        fit_mesh, mano_layers = _load_mano_backend()
-        mano_betas = _load_mano_betas(path)
+        mesh_from_skeleton, mano_layers = _load_mano_backend()
 
-    server = ViserServer(host="127.0.0.1", port=0)   # 随机空闲端口,无需客户端
+    server = ViserServer(host="127.0.0.1", port=0)
     try:
         server.scene.set_up_direction((0.0, 1.0, 0.0))
         server.initial_camera.position = (0.038, 4.176, -5.413)
         server.initial_camera.look_at = (0.0, 1.0, 0.0)
         server.initial_camera.up = (0.0, -1.0, 0.0)
         server.initial_camera.fov = 50.0
-        # 与 viz-h5 相同:数据/桌面整体抬高 1m,grid 仍在 y=0
-        server.scene.add_frame("/world", position=(0.0, 1.0, 0.0), show_axes=False)
+        server.scene.add_frame(
+            "/world", position=(0.0, 1.0, 0.0), show_axes=False,
+        )
 
         serializer = server.get_scene_serializer()
         nodes = build_scene_nodes(server.scene, data)
         mano_meshes: dict[str, object] = {}
+        mano_joint_handles: dict[str, tuple[object, object]] = {}
+        mano_indices: dict[str, int] = {}
         if mano:
+            assert mesh_from_skeleton is not None
             for side in ("left", "right"):
                 hand = data["hands"][side]
-                if hand["nodes"].shape[1] != 21:
+                beta = hand["mano_beta"]
+                if beta is None or hand["nodes"].shape[1:] != (21, 3):
+                    continue
+                valid_indices = np.flatnonzero(
+                    np.isfinite(hand["nodes"]).all(axis=(1, 2)),
+                )
+                if not valid_indices.size:
                     continue
                 index = nearest_idx(hand["t"], int(data["t_mocap"][0]))
-                verts, _joints, _params = fit_mesh(
-                    mano_layers[side],
-                    hand["nodes"][index],
-                    beta=mano_betas[side],
-                    iters=0,
+                if index not in valid_indices:
+                    index = int(valid_indices[0])
+                verts, points = mesh_from_skeleton(
+                    mano_layers[side], hand["nodes"][index], beta,
                 )
+                mano_indices[side] = index
                 mano_meshes[side] = server.scene.add_mesh_simple(
                     f"/world/mano/{side}",
                     vertices=verts,
@@ -254,6 +248,27 @@ def _record_h5(path: Path, *, mano: bool = False) -> bytes:
                     side="double",
                     material="standard",
                 )
+                parents = mano_layers[side].parents
+                segments = np.asarray([
+                    [points[joint], points[parent]]
+                    for joint, parent in enumerate(parents) if parent >= 0
+                ], dtype=np.float32)
+                color = ((214, 39, 40) if side == "left" else (31, 119, 180))
+                point_cloud = server.scene.add_point_cloud(
+                    f"/world/mano/{side}/joints16",
+                    points=points,
+                    colors=np.tile(color, (16, 1)).astype(np.uint8),
+                    point_size=0.007,
+                    point_shape="circle",
+                    precision="float32",
+                )
+                lines = server.scene.add_line_segments(
+                    f"/world/mano/{side}/bones16",
+                    points=segments,
+                    colors=np.tile(color, (15, 2, 1)).astype(np.uint8),
+                    line_width=2.5,
+                )
+                mano_joint_handles[side] = (point_cloud, lines)
 
         t_mocap = data["t_mocap"]
         prev_ns: int | None = None
@@ -264,13 +279,27 @@ def _record_h5(path: Path, *, mano: bool = False) -> bytes:
                 for side, mesh in mano_meshes.items():
                     hand = data["hands"][side]
                     index = nearest_idx(hand["t"], t_ns)
-                    verts, _joints, _params = fit_mesh(
-                        mano_layers[side],
-                        hand["nodes"][index],
-                        beta=mano_betas[side],
-                        iters=0,
-                    )
-                    mesh.vertices = verts
+                    if index == mano_indices[side]:
+                        continue
+                    skeleton = hand["nodes"][index]
+                    visible = bool(np.isfinite(skeleton).all())
+                    mesh.visible = visible
+                    point_cloud, lines = mano_joint_handles[side]
+                    point_cloud.visible = visible
+                    lines.visible = visible
+                    if visible:
+                        verts, points = mesh_from_skeleton(
+                            mano_layers[side], skeleton, hand["mano_beta"],
+                        )
+                        mesh.vertices = verts
+                        point_cloud.points = points
+                        parents = mano_layers[side].parents
+                        lines.points = np.asarray([
+                            [points[joint], points[parent]]
+                            for joint, parent in enumerate(parents)
+                            if parent >= 0
+                        ], dtype=np.float32)
+                    mano_indices[side] = index
             if prev_ns is not None:
                 serializer.insert_sleep((t_ns - prev_ns) / 1e9)
             prev_ns = t_ns

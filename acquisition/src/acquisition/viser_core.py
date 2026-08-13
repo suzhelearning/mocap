@@ -158,14 +158,27 @@ def extract_hdf5(f: h5py.File) -> dict:
             for _ in range(n)
         ]
 
-    # 双手骨架(按自身时间戳对齐);新文件 mano_skeleton(21 点),旧文件 nodes_global
+    # 双手骨架按自身时间戳对齐。MANO 表面只需要原始 21 点和一次性 beta；
+    # 16 关键点由 mano_skeleton 直接重排，不加载任何逐帧拟合缓存。
     hands: dict[str, dict] = {}
     for side in ("left", "right"):
         g = f["hands"][side]
         node_key = "mano_skeleton" if "mano_skeleton" in g else "nodes_global"
+        t_hand = g["t_ubuntu_ns"][:].astype(np.int64)
+        nodes = np.asarray(g[node_key][:])
+        if nodes.ndim != 3 or nodes.shape[2] != 3:
+            raise ValueError(
+                f"hands/{side}/{node_key} 必须是 (N,K,3)，实际为 {nodes.shape}",
+            )
+        beta = None
+        if "mano_beta" in g:
+            beta = np.asarray(g["mano_beta"][:], dtype=np.float64)
+            if beta.shape != (10,) or not np.isfinite(beta).all():
+                raise ValueError(f"hands/{side}/mano_beta 必须是有限 (10,)")
         hands[side] = {
-            "t": g["t_ubuntu_ns"][:].astype(np.int64),
-            "nodes": g[node_key][:],
+            "t": t_hand,
+            "nodes": nodes,
+            "mano_beta": beta,
         }
 
     # 命名物体刚体(新 schema 核心数据):名字 -> 帧列表

@@ -64,6 +64,11 @@ class H5AdapterTest(unittest.TestCase):
         self.assertEqual(detail.metadata["scene"]["mocap_frames"], 3)
         self.assertTrue(detail.metadata["mano"]["available"])
         self.assertEqual(detail.metadata["mano"]["sides"]["left"]["shape"], [10])
+        self.assertEqual(
+            detail.metadata["mano"]["sides"]["left"]["source"],
+            "h5-skeleton-direct",
+        )
+        self.assertTrue(detail.metadata["mano"]["sides"]["left"]["joints16"])
 
         with tempfile.TemporaryDirectory() as cache:
             cache_dir = Path(cache)
@@ -81,9 +86,10 @@ class H5AdapterTest(unittest.TestCase):
             playback = self.adapter.build_viser_with_mode(
                 sample.id, Path(cache), "mano",
             )
-            self.assertTrue(playback.recording_path.name.endswith(".mano.viser"))
+            self.assertRegex(playback.recording_path.name, r"\.mano-v\d+\.viser$")
             self.assertTrue(playback.recording_path.is_file())
             self.assertGreater(playback.recording_path.stat().st_size, 0)
+
 
     def test_mano_mode_rejects_invalid_beta_shape(self):
         with h5py.File(self.path, "r+") as f:

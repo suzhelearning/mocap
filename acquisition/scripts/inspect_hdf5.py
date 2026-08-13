@@ -131,6 +131,34 @@ def _check_ragged(
             errors.append(
                 f"{label}/{field} flat 长度 {len(dataset)} != {flat_count}")
 
+_OBSOLETE_MANO_FIELDS = (
+    "mano_joints16",
+    "mano_pose",
+    "mano_translation",
+    "mano_scale",
+    "mano_fit_valid",
+)
+
+
+def _check_mano_beta(
+    group: h5py.Group,
+    label: str,
+    errors: list[str],
+) -> None:
+    """校验最小 MANO 契约：原始关键点 + 一次性 beta。"""
+    if "mano_beta" in group:
+        beta = np.asarray(group["mano_beta"][:])
+        if beta.shape != (10,):
+            errors.append(f"{label}/mano_beta 形状 {beta.shape} != (10,)")
+        elif not np.isfinite(beta).all():
+            errors.append(f"{label}/mano_beta 含 NaN/Inf")
+    obsolete = [name for name in _OBSOLETE_MANO_FIELDS if name in group]
+    if obsolete:
+        errors.append(
+            f"{label} 含已废弃的逐帧 MANO 派生字段 {obsolete}；"
+            "运行 mano-beta --force 清理",
+        )
+
 
 def inspect_file(
     path: str | Path,
@@ -265,6 +293,11 @@ def inspect_file(
                     if root_error > 1e-5:
                         errors.append(
                             f"hands/{side} root/wrist 误差 {root_error:.2e}m")
+            _check_mano_beta(
+                group,
+                f"hands/{side}",
+                errors,
+            )
             edges = group.attrs.get("edges_json")
             if strict and not edges:
                 errors.append(f"hands/{side} 缺少 edges_json 拓扑")

@@ -125,9 +125,8 @@ bash ../record.sh
           rigid_bodies/{frame_offsets,ids,positions,quaternions_xyzw,
                         tracking_valid,mean_error}
           markers/{frame_offsets,positions,raw_ids,occluded,id_kinds}（可关）
-/hands/{left,right}  t_ubuntu_ns, seq, nodes_raw(25,3), wrist_position,
-                     wrist_quaternion_xyzw, nodes_global(25,3), edges_json,
-                     mano_skeleton(21,3), mano_beta(10,)
+/hands/{left,right}  t_ubuntu_ns, seq, wrist_position, wrist_quaternion_xyzw,
+                     mano_skeleton(N,21,3);离线可追加 mano_beta(10)
 /objects/{name}      t_ubuntu_ns, position, quaternion_xyzw, tracking_valid
 /events              t_ubuntu_ns, type(0=start..5=quit), note
 ```
@@ -141,14 +140,22 @@ bash ../record.sh
 插值（位置 lerp + 四元数 slerp）。`inspect --strict` 会检查 offsets/flat、时间、频率、
 拓扑和拼接一致性。
 
-**MANO 网格回放**：录制完成后可离线估计每只手形状参数并写回 HDF5：
+**MANO beta 写回**：录制完成后运行：
 
 ```bash
-pixi run mano-beta -- /home/current/data/20260812        # 单日目录（递归）
+bash ../add_mano_beta.sh -f                         # 当前日期
+bash ../add_mano_beta.sh -f /home/current/data/20260812
 ```
 
-写回 `hands/<side>/mano_beta(10,)`；data-viewer（`./viewer.sh`）的 MANO 播放模式
-加载该参数驱动 MANO 网格，未写入时使用中性形状 β=0。
+每只手从最多 1000 个有效 `mano_skeleton` 帧的稳健骨段长度估计一次
+`mano_beta(10)`。H5 不保存 `mano_pose`、`mano_translation`、`mano_scale`、
+`mano_joints16` 或 `mano_fit_valid` 等逐帧派生数组。
+
+可视化的 MANO 16 关节直接从原始 21 点按以下索引取得：
+`[0,5,6,7,9,10,11,17,18,19,13,14,15,1,2,3]`，顺序为
+`wrist,index×3,middle×3,pinky×3,ring×3,thumb×3`。`viz-h5 --mano`
+和根目录 `viewer.sh` 使用这 16 个原始点作为骨骼锚点，以 `beta` 生成手形，
+再执行确定性的 MANO blend-shape + LBS 表面蒙皮；每帧不运行数值拟合。
 
 ## 已验证
 

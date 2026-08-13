@@ -67,11 +67,16 @@ marker 字段：
 
 ## 固定形状数据
 
-- `hands/<side>`：`t_ubuntu_ns`、`seq`、`wrist_position(3)`、
+- `hands/<side>` 原始字段：`t_ubuntu_ns`、`seq`、`wrist_position(3)`、
   `wrist_quaternion_xyzw(4)`、`nodes_raw(25,3)`、`nodes_global(25,3)`；
-  可选 `mano_skeleton(21,3)`（MediaPipe 21 点全局手骨架）与
-  `mano_beta(10,)`（MANO 形状参数，由 `pixi run mano-beta` 离线估计写入，
-  单位注释见 `mano_beta.py`）。
+  新录制包含 `mano_skeleton(N,21,3)`（MediaPipe 顺序、世界系米制）。
+- `pixi run mano-beta` 离线追加 `mano_beta(10,)`：整条录制共用的形状参数，
+  从最多 1000 帧 `mano_skeleton` 的稳健骨段长度估计。
+- 不存储 `mano_pose`、`mano_translation`、`mano_scale`、`mano_joints16`
+  和 `mano_fit_valid`；这些逐帧数组要么语义不属于原始观测，要么可直接派生。
+- MANO 原生 16 关节直接取
+  `mano_skeleton[:, [0,5,6,7,9,10,11,17,18,19,13,14,15,1,2,3], :]`，
+  顺序为 `wrist,index×3,middle×3,pinky×3,ring×3,thumb×3`。
 - `objects/<name>`：`t_ubuntu_ns`、`position(3)`、`quaternion_xyzw(4)`、`tracking_valid`。
 - `events`：`t_ubuntu_ns`、`type`（`0=start`、`1=pause`、`2=resume`、
   `3=save`、`4=discard`、`5=quit`）、`note`。
@@ -82,8 +87,13 @@ marker 字段：
 ```bash
 pixi run inspect -- --strict /path/to/take.h5
 pixi run replay -- /path/to/take.h5 --target-hz 120 --json replay.jsonl
-pixi run viz-h5 -- /path/to/take.h5
+pixi run viz-h5 -- /path/to/YYYYMMDD --mano
+# 或在 mocap 根目录：
+./viewer.sh /path/to/YYYYMMDD
 ```
 
-严格检查会验证 offsets/flat 长度、时间单调性、最大帧间隙、频率、拓扑、手腕根节点
-一致性和物体跟踪率。发布前应保存 `inspect --strict` 的退出码为 0 作为质量门。
+`viz-h5 --mano` 与 viewer 的 MANO 模式读取 `mano_skeleton + mano_beta`。
+16 关节显示值是原始 21 点的直接重排；表面使用这些点作为目标骨骼锚点，
+执行确定性的 MANO blend-shape + LBS 蒙皮，不运行逐帧数值拟合。严格检查会验证
+拓扑、手腕根节点一致性、`mano_beta` 形状/有限值、是否残留已废弃逐帧字段以及
+物体跟踪率。发布前应保存 `inspect --strict` 的退出码为 0 作为质量门。
