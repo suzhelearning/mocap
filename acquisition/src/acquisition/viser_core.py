@@ -8,12 +8,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import h5py
 import numpy as np
 import viser
+
+from .kinematics import quat_xyzw_to_wxyz
 
 # ---- 配色与拓扑(与 live_view.py 保持一致) ----
 CHAIN_COLORS = {
@@ -64,6 +67,99 @@ HAND_EDGES = [(c, p) for c, p in MANO_PALM_EDGES] + list(MANO_FINGER_EDGES)
 KIND_INDEX = {"active": 0, "asset_member": 1, "point_cloud": 2, "unknown": 3}
 _KIND_COLORS = {v: MARKER_COLORS[k] for k, v in KIND_INDEX.items()}
 
+OBJECT_MESH_DIR = Path(__file__).resolve().parents[3] / "assets" / "objects"
+OBJECT_MESH_COLOR = (245, 158, 11)
+
+
+def find_object_mesh(name: str, mesh_dir: Path = OBJECT_MESH_DIR) -> Path | None:
+    """按 HDF5 物体名匹配 OBJ：优先米制 ``<name>_m.obj``，兼容毫米制 ``<name>.obj``。"""
+    if not mesh_dir.is_dir():
+        return None
+    wanted = (f"{name}_m".casefold(), name.casefold())
+    by_stem = {
+        path.stem.casefold(): path
+        for path in mesh_dir.glob("*.obj")
+        if path.is_file()
+    }
+    return next((by_stem[stem] for stem in wanted if stem in by_stem), None)
+
+
+@lru_cache(maxsize=32)
+def _load_obj_mesh_cached(
+    path_str: str, mtime_ns: int, scale_to_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """读取 OBJ 顶点和面；mtime 作为缓存键，资源替换后自动重载。"""
+    del mtime_ns
+    vertices: list[list[float]] = []
+    faces: list[tuple[int, int, int]] = []
+    with Path(path_str).open("r", encoding="utf-8") as stream:
+        for line_no, line in enumerate(stream, 1):
+            fields = line.split()
+            if not fields or fields[0].startswith("#"):
+                continue
+            if fields[0] == "v":
+                if len(fields) < 4:
+                    raise ValueError(f"{path_str}:{line_no} 顶点字段不足")
+                vertices.append([float(fields[1]), float(fields[2]), float(fields[3])])
+                continue
+            if fields[0] != "f":
+                continue
+            if len(fields) < 4:
+                raise ValueError(f"{path_str}:{line_no} 面少于 3 个顶点")
+            indices: list[int] = []
+            for field in fields[1:]:
+                raw = field.split("/", 1)[0]
+                if not raw:
+                    raise ValueError(f"{path_str}:{line_no} 面顶点索引为空")
+                index = int(raw)
+                index = len(vertices) + index if index < 0 else index - 1
+                if not 0 <= index < len(vertices):
+                    raise ValueError(f"{path_str}:{line_no} 面顶点索引越界")
+                indices.append(index)
+            faces.extend(
+                (indices[0], indices[i], indices[i + 1])
+                for i in range(1, len(indices) - 1)
+            )
+    verts = np.asarray(vertices, dtype=np.float32) * np.float32(scale_to_m)
+    tris = np.asarray(faces, dtype=np.int64)
+    if verts.ndim != 2 or verts.shape[1:] != (3,) or not len(verts):
+        raise ValueError(f"{path_str} 不含有效 OBJ 顶点")
+    if tris.ndim != 2 or tris.shape[1:] != (3,) or not len(tris):
+        raise ValueError(f"{path_str} 不含有效 OBJ 面")
+    if not np.isfinite(verts).all():
+        raise ValueError(f"{path_str} 顶点含 NaN/Inf")
+    verts.setflags(write=False)
+    tris.setflags(write=False)
+    return verts, tris
+
+
+def load_object_mesh(
+    name: str, mesh_dir: Path = OBJECT_MESH_DIR,
+) -> tuple[Path, np.ndarray, np.ndarray] | None:
+    """加载同名 OBJ 并统一为米，返回 ``(path, vertices, triangle_faces)``。
+
+    ``<name>_m.obj`` 的顶点已经是米；SolidWorks/Blender 导出的普通
+    ``<name>.obj`` 按毫米解释并乘 ``0.001``。
+    """
+    path = find_object_mesh(name, mesh_dir)
+    if path is None:
+        return None
+    scale_to_m = 1.0 if path.stem.casefold().endswith("_m") else 1e-3
+    vertices, faces = _load_obj_mesh_cached(
+        str(path), path.stat().st_mtime_ns, scale_to_m,
+    )
+    return path, vertices, faces
+
+
+def object_mesh_assets_mtime_ns(mesh_dir: Path = OBJECT_MESH_DIR) -> int:
+    """返回 OBJ 资源的最新修改时间，供离线 viewer 缓存失效判断。"""
+    if not mesh_dir.is_dir():
+        return 0
+    return max(
+        (path.stat().st_mtime_ns for path in mesh_dir.glob("*.obj") if path.is_file()),
+        default=0,
+    )
+
 
 def reject_external_links(f: h5py.File, prefix: str = "") -> None:
     """递归检查并拒绝含外部/软链接的 HDF5(不解析链接,仅查类型)。"""
@@ -83,11 +179,6 @@ def nearest_idx(t: np.ndarray, t_ns: float) -> int:
     """在单调时间戳数组上取 t_ns 的最近邻下标(夹取到边界)。"""
     i = int(np.searchsorted(t, t_ns, side="right")) - 1
     return min(max(i, 0), t.size - 1)
-
-
-def quat_xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
-    return q[[3, 0, 1, 2]]
-
 
 def marker_colors(kinds, occluded) -> np.ndarray:
     colors = np.zeros((len(kinds), 3), dtype=np.uint8)
@@ -214,6 +305,7 @@ class SceneNodes:
     rigid_labels: dict[int, viser.LabelHandle] = field(default_factory=dict)
     obj_frames: dict[str, viser.FrameHandle] = field(default_factory=dict)
     obj_labels: dict[str, viser.LabelHandle] = field(default_factory=dict)
+    obj_meshes: dict[str, viser.MeshHandle] = field(default_factory=dict)
     marker_pc: viser.PointCloudHandle | None = None
     hand_pc: dict[str, viser.PointCloudHandle] = field(default_factory=dict)
     hand_ls: dict[str, viser.LineSegmentsHandle] = field(default_factory=dict)
@@ -251,12 +343,27 @@ def build_scene_nodes(scene: viser.ViserScene, data: dict) -> SceneNodes:
         nodes.rigid_labels[rid] = lb
         nodes.handles.extend((fh, lb))
 
-    # 命名物体刚体:每个物体一个坐标轴 + 标签
+    # 命名物体：坐标轴和网格直接使用 HDF5 位姿；坐标预处理由独立
+    # object-offset 程序在派生文件中完成，viewer 不应用任何外参。
     for name in data["obj_frames"]:
         fh = scene.add_frame(
-            f"/world/object/{name}", axes_length=0.12, axes_radius=0.008)
+            f"/world/object/{name}", axes_length=0.02, axes_radius=0.0008)
         lb = scene.add_label(
-            f"/world/object/{name}/label", name, position=(0, 0.05, 0))
+            f"/world/object/{name}/label", name, position=(0, 0.025, 0))
+        loaded = load_object_mesh(name)
+        if loaded is not None:
+            _path, vertices, faces = loaded
+            mesh = scene.add_mesh_simple(
+                f"/world/object/{name}/mesh",
+                vertices=vertices,
+                faces=faces,
+                color=OBJECT_MESH_COLOR,
+                opacity=1.0,
+                side="double",
+                material="standard",
+            )
+            nodes.obj_meshes[name] = mesh
+            nodes.handles.append(mesh)
         nodes.obj_frames[name] = fh
         nodes.obj_labels[name] = lb
         nodes.handles.extend((fh, lb))
@@ -325,15 +432,20 @@ def apply_frame(nodes: SceneNodes, data: dict, t_ns: float) -> dict:
         while k > 0 and t_arr[k] > t_ns:
             k -= 1
         t_k, pos, quat, valid = frames[k]
+        mesh = nodes.obj_meshes.get(name)
         if valid:
             fh.position = pos
             fh.wxyz = quat_xyzw_to_wxyz(quat)
             fh.visible = True
-            lb.position = (pos[0], pos[1] + 0.05, pos[2])
+            lb.position = (0.0, 0.025, 0.0)
             lb.visible = True
+            if mesh is not None:
+                mesh.visible = True
         else:
             fh.visible = False
             lb.visible = False
+            if mesh is not None:
+                mesh.visible = False
 
     # markers
     pts, colors = data["mk_frames"][i]

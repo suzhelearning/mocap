@@ -29,6 +29,7 @@ from acquisition.viser_core import (  # noqa: E402
     build_scene_nodes,
     extract_hdf5,
     nearest_idx,
+    object_mesh_assets_mtime_ns,
     probe_h5,
     reject_external_links,
 )
@@ -42,9 +43,10 @@ from data_viewer.contracts import (  # noqa: E402
 )
 from viser import ViserServer  # noqa: E402
 
-# 录制时间轴步长(帧):原始 ~100Hz 全量写入文件过大,隔帧采样 ~50Hz 已足够流畅
+# 资源/场景契约变化时提升版本；OBJ 修改时间另参与缓存新鲜度判断。
 RECORD_STEP = 2
-MANO_RECORDING_VERSION = 4
+RECORDING_VERSION = 7
+MANO_RECORDING_VERSION = 10
 
 
 class H5ViewerAdapter(ViewerAdapter):
@@ -142,9 +144,10 @@ class H5ViewerAdapter(ViewerAdapter):
         if not sample.path.is_file():
             raise FileNotFoundError(sample.path)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        recording = cache_dir / (sample.path.stem + ".viser")
-        if not (recording.is_file()
-                and recording.stat().st_mtime >= sample.path.stat().st_mtime):
+        recording = cache_dir / (
+            f"{sample.path.stem}.v{RECORDING_VERSION}.viser"
+        )
+        if not _recording_is_fresh(recording, sample.path):
             recording.write_bytes(_record_h5(sample.path))
         return ViserPlayback(recording_path=recording, label=sample.label,
                              warnings=[] if recording.is_file() else ["录制失败"])
@@ -160,8 +163,7 @@ class H5ViewerAdapter(ViewerAdapter):
         recording = cache_dir / (
             f"{sample.path.stem}.mano-v{MANO_RECORDING_VERSION}.viser"
         )
-        if not (recording.is_file()
-                and recording.stat().st_mtime >= sample.path.stat().st_mtime):
+        if not _recording_is_fresh(recording, sample.path):
             recording.write_bytes(_record_h5(sample.path, mano=True))
         return ViserPlayback(
             recording_path=recording,
@@ -182,6 +184,18 @@ class H5ViewerAdapter(ViewerAdapter):
         rel_parts = path.relative_to(self.root).parts
         hidden = set(self.config.hidden_names)
         return any(part in hidden or part.endswith(".egg-info") for part in rel_parts)
+
+
+def _recording_is_fresh(recording: Path, source: Path) -> bool:
+    """H5 或任一 OBJ 晚于缓存时重建，避免显示旧网格。"""
+    if not recording.is_file():
+        return False
+    newest_source_ns = max(
+        source.stat().st_mtime_ns,
+        object_mesh_assets_mtime_ns(),
+    )
+    return recording.stat().st_mtime_ns >= newest_source_ns
+
 
 def _load_mano_backend():
     """延迟加载 MANO；每帧由原始关键点确定性蒙皮，不运行数值拟合。"""

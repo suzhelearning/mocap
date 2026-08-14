@@ -1,0 +1,12 @@
+# Motive 刚体坐标系 <- 真实 OBJ 坐标系的固定外参。
+# 对每个物体满足：T_world_from_obj = T_world_from_motive_rigid @ T_motive_rigid_from_obj
+version: 1
+objects:
+  cylinder:
+    motive_rigid_from_obj:
+      translation_m: [-0.010, 0.0, 0.0]
+      # Rz(-90°) @ Rx(175°) @ Ry(0°)
+      rotation_matrix:
+        - [0.0, -0.9961946980917455, -0.0871557427476582]
+        - [-1.0, 0.0, 0.0]
+        - [0.0, 0.0871557427476582, -0.9961946980917455]

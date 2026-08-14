@@ -23,6 +23,7 @@ import socket
 
 from .config import Config
 from .kinematics import quat_xyzw_to_wxyz
+from .viser_core import load_object_mesh
 from .state_machine import State
 
 FREQ_OPTIONS = ("30", "60", "100", "120")
@@ -236,6 +237,21 @@ class StitchedScene:
                                               axes_length=0.025, axes_radius=0.002)
             for name in config.objects
         }
+        self._object_meshes: dict[str, viser.MeshHandle] = {}
+        for name in config.objects:
+            loaded = load_object_mesh(name)
+            if loaded is None:
+                continue
+            _path, vertices, faces = loaded
+            self._object_meshes[name] = self.server.scene.add_mesh_simple(
+                f"/rigid/object/{name}/mesh",
+                vertices=vertices,
+                faces=faces,
+                color=OBJECT_COLOR,
+                opacity=0.82,
+                side="double",
+                material="standard",
+            )
         self._object_labels = {
             name: self.server.scene.add_label(f"/label/object/{name}", name, position=(0, 0, 0),
                                               anchor="bottom-center", font_screen_scale=0.8)
@@ -520,12 +536,13 @@ class StitchedScene:
                         break
                 frame = self._objects[name]
                 if obj is not None:
-                    frame.position = np.asarray(obj["position"], dtype=float)
+                    position = np.asarray(obj["position"], dtype=float)
+                    frame.position = position
                     frame.wxyz = quat_xyzw_to_wxyz(obj["quaternion_xyzw"])
                     frame.visible = rigid_visible
                     self._object_labels[name].visible = rigid_visible
                     self._object_labels[name].position = (
-                        np.asarray(obj["position"], dtype=float) + np.array([0.0, 0.06, 0.0])
+                        position + np.array([0.0, 0.06, 0.0])
                     )
                 else:
                     frame.visible = False

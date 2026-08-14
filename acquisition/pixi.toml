@@ -12,6 +12,7 @@ inspect = "python scripts/inspect_hdf5.py"
 replay = "python scripts/replay_hdf5.py"
 viz-h5 = "python scripts/viz_hdf5.py"   # 用法: pixi run viz-h5 -- <日期文件夹> [--port 8082]
 mano-beta = "python scripts/mano_beta.py"  # 从至多1000帧关键点估计每只手 beta
+object-offset = "python scripts/motive_object_offset.py"  # 原始 H5 -> 真实 OBJ frame 派生 H5
 test = "pytest tests"
 start-router = "bash scripts/start_zenohd.sh"
 

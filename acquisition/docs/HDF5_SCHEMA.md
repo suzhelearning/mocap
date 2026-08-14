@@ -77,7 +77,9 @@ marker 字段：
 - MANO 原生 16 关节直接取
   `mano_skeleton[:, [0,5,6,7,9,10,11,17,18,19,13,14,15,1,2,3], :]`，
   顺序为 `wrist,index×3,middle×3,pinky×3,ring×3,thumb×3`。
-- `objects/<name>`：`t_ubuntu_ns`、`position(3)`、`quaternion_xyzw(4)`、`tracking_valid`。
+- `objects/<name>`：`t_ubuntu_ns`、`object_position(3)`、
+  `object_quaternion_xyzw(4)`、`tracking_valid`。原始录制的位姿 frame 是
+  Motive rigid body；`object-offset` 派生文件中的位姿 frame 是真实 OBJ。
 - `events`：`t_ubuntu_ns`、`type`（`0=start`、`1=pause`、`2=resume`、
   `3=save`、`4=discard`、`5=quit`）、`note`。
 - `hands/<side>` 的 `edges_json` 保存该侧首次收到的骨骼拓扑。
@@ -86,6 +88,8 @@ marker 字段：
 
 ```bash
 pixi run inspect -- --strict /path/to/take.h5
+pixi run object-offset -- /path/to/take.h5
+# 输出 /path/to/take_obj.h5；可用 -o 指定输出，--object 选择物体
 pixi run replay -- /path/to/take.h5 --target-hz 120 --json replay.jsonl
 pixi run viz-h5 -- /path/to/YYYYMMDD --mano
 # 或在 mocap 根目录：
@@ -97,3 +101,10 @@ pixi run viz-h5 -- /path/to/YYYYMMDD --mano
 执行确定性的 MANO blend-shape + LBS 蒙皮，不运行逐帧数值拟合。严格检查会验证
 拓扑、手腕根节点一致性、`mano_beta` 形状/有限值、是否残留已废弃逐帧字段以及
 物体跟踪率。发布前应保存 `inspect --strict` 的退出码为 0 作为质量门。
+
+`config/object_offsets.yaml` 为每个物体保存
+`T_motive_rigid_from_obj`。预处理按
+`T_world_from_obj = T_world_from_motive_rigid @ T_motive_rigid_from_obj`
+转换标准 object 位姿字段，原始 HDF5 永远只读，输出文件拒绝覆盖。派生物体组通过
+`object_pose_frame=obj`、源文件 SHA-256 和实际外参 attrs 保留坐标语义与来源。
+viewer 对原始或派生文件都只读取字段值，不执行隐式外参，避免重复转换。

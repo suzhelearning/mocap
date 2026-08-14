@@ -157,6 +157,22 @@ bash ../add_mano_beta.sh -f /home/current/data/20260812
 和根目录 `viewer.sh` 使用这 16 个原始点作为骨骼锚点，以 `beta` 生成手形，
 再执行确定性的 MANO blend-shape + LBS 表面蒙皮；每帧不运行数值拟合。
 
+物体网格从根目录 `assets/objects/<object>_m.obj`（米制）或
+`assets/objects/<object>.obj`（毫米制，加载时自动乘 `0.001`）加载；
+`<object>` 必须与 HDF5 的 `objects/<object>` 同名。当前 `cylinder_m.obj`
+加载后的包围盒为 `18×150×18 mm`，原点接近几何中心，轴向为局部 `+Y`。
+Motive 刚体 frame 到真实 OBJ frame 的固定外参统一保存在根目录
+`config/object_offsets.yaml`。viewer 始终直接显示 HDF5 中的
+`object_position/object_quaternion_xyzw`，不应用 offset。需要转换时运行：
+`pixi run object-offset -- <raw.h5>`；程序只读原始文件并生成
+`<raw_stem>_obj.h5`，派生文件中的标准 object 位姿字段已经处于 OBJ frame。
+配置中的物体名必须与 `objects/<name>` 和 OBJ 文件名一致；
+`translation_m` 与 `rotation_matrix` 表示 `T_motive_rigid_from_obj`，即把 OBJ
+局部坐标表达转换到 Motive rigid frame。命令默认处理 HDF5 中全部物体，任一物体
+缺少外参即失败，避免静默生成混合坐标数据；可重复传
+`--object <name>` 只处理明确选择的物体。输出已存在时拒绝覆盖，并在文件及物体
+attrs 中记录 source SHA-256、配置 SHA-256、处理物体和坐标 frame。
+
 ## 已验证
 
 - **自动测试**：CI 与本地 `pixi run test` 覆盖 config、运动学、拼接、消息解析、
