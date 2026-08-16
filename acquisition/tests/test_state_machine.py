@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from acquisition.config import Config, load_config
-from acquisition.recorder import EV_DISCARD, EV_SAVE, EV_START
+from acquisition.recorder import EV_SAVE, EV_START
 from acquisition.state_machine import State, TakeController
 
 TEST_CONFIG = """
@@ -30,15 +30,15 @@ class FakeWriter:
         self.begin_args = None
         self.saved = False
         self.discarded = False
-        self.counts_ = {"mocap": 3, "left": 1, "right": 1}
+        self.counts_ = {"aligned": 2}
         self.path = Path("take_fake.h5")
 
     def begin(self, take_id, start_wall_ns):
         self.begin_args = (take_id, start_wall_ns)
         self.events.append("begin")
 
-    def append_event(self, ev_type, note=""):
-        self.events.append(("event", ev_type, note))
+    def append_event(self, ev_type):
+        self.events.append(("event", ev_type))
 
     def finalize_save(self):
         self.events.append("save")
@@ -74,11 +74,12 @@ def test_full_cycle_save(tmp_path):
     assert ctrl.state is State.RECORDING
     assert ctrl.writer is writers[0]
     assert writers[0].begin_args[0] == 1
-    assert ("event", EV_START, "start") in writers[0].events
+    assert ("event", EV_START) in writers[0].events
 
     assert ctrl.handle("s") is True
     assert ctrl.state is State.IDLE
     assert writers[0].saved
+    assert ("event", EV_SAVE) in writers[0].events
     assert not writers[0].discarded
     assert ctrl.writer is None
     assert "saved" in ctrl.last_result
@@ -101,7 +102,6 @@ def test_quit_recording_discards(tmp_path):
     assert ctrl.state is State.IDLE
     assert writers[0].discarded
     assert ctrl.quit_requested
-    assert ("event", EV_DISCARD, "discard") in writers[0].events
 
 
 def test_quit_idle(tmp_path):

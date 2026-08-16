@@ -2,7 +2,7 @@
 channels = ["conda-forge"]
 name = "mocap"
 platforms = ["linux-64"]
-version = "0.1.0"
+version = "1.0.0"
 
 [tasks]
 view = "mocap-viewer"

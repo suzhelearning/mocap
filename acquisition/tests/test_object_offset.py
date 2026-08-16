@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,14 +12,24 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
+from acquisition import cli as acquisition_cli
 from acquisition.object_offset import (
     DEFAULT_OBJECT_OFFSETS_PATH,
     ObjectOffsetError,
     load_object_offsets,
+    offset_from_motive_visuals,
     preprocess_hdf5,
+    require_object_offsets,
     transform_object_poses,
 )
 from acquisition.viser_core import SceneNodes, apply_frame
+
+
+_ADD_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "add_object_offset.py"
+_ADD_SPEC = importlib.util.spec_from_file_location("add_object_offset", _ADD_SCRIPT)
+assert _ADD_SPEC is not None and _ADD_SPEC.loader is not None
+_ADD = importlib.util.module_from_spec(_ADD_SPEC)
+_ADD_SPEC.loader.exec_module(_ADD)
 
 
 RIGID_FROM_OBJ = np.asarray([
@@ -78,6 +89,93 @@ def test_default_cylinder_offset_matches_authoritative_matrix() -> None:
         RIGID_FROM_OBJ,
         atol=1e-12,
     )
+
+
+def test_motive_visuals_gl_go_converts_mm_and_xyz_euler_order() -> None:
+    offset = offset_from_motive_visuals(
+        [12.0, -34.0, 56.0],
+        [10.0, 20.0, 30.0],
+    )
+
+    np.testing.assert_allclose(offset.translation_m, [0.012, -0.034, 0.056])
+    np.testing.assert_allclose(
+        offset.rotation_matrix,
+        Rotation.from_euler("xyz", [10.0, 20.0, 30.0], degrees=True).as_matrix(),
+        atol=1e-12,
+    )
+
+
+def test_required_offsets_rejects_every_missing_capture_object() -> None:
+    configured = load_object_offsets(DEFAULT_OBJECT_OFFSETS_PATH)
+
+    with pytest.raises(ObjectOffsetError) as caught:
+        require_object_offsets(["cylinder", "cup", "bottle"], configured)
+
+    message = str(caught.value)
+    assert "bottle" in message and "cup" in message
+    assert "Geometry Location (GL)" in message
+    assert "Geometry Orientation (GO)" in message
+    assert "add-object-offset" in message
+
+
+def test_add_object_offset_script_writes_loadable_config_and_refuses_overwrite(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "object_offsets.yaml"
+    _write_config(config)
+    args = [
+        "cup",
+        "--gl-mm", "12", "-34", "56",
+        "--go-deg", "10", "20", "30",
+        "--config", str(config),
+    ]
+
+    assert _ADD.main(args) == 0
+    offsets = load_object_offsets(config)
+    assert set(offsets) == {"cylinder", "cup"}
+    np.testing.assert_allclose(offsets["cup"].translation_m, [0.012, -0.034, 0.056])
+    np.testing.assert_allclose(
+        offsets["cup"].rotation_matrix,
+        Rotation.from_euler("xyz", [10.0, 20.0, 30.0], degrees=True).as_matrix(),
+        atol=1e-12,
+    )
+    config_hash = _sha256(config)
+    assert _ADD.main(args) == 1
+    assert _sha256(config) == config_hash
+
+
+def test_cli_refuses_configured_object_without_offset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "router:\n"
+        "  endpoint: tcp/127.0.0.1:7447\n"
+        "rigid_bodies:\n"
+        "  back: 5\n"
+        "  objects: {cup: 11}\n"
+        "hands:\n"
+        "  left: {back_rigid_id: 5}\n"
+        "  right: {back_rigid_id: 5}\n"
+        "alignment: {output_hz: 60, latency_ms: 50}\n"
+        f"recording: {{output_dir: {tmp_path / 'captures'}}}\n",
+        encoding="utf-8",
+    )
+    cylinder = load_object_offsets(DEFAULT_OBJECT_OFFSETS_PATH)["cylinder"]
+    monkeypatch.setattr(
+        acquisition_cli,
+        "load_object_offsets",
+        lambda: {"cylinder": cylinder},
+    )
+
+    assert acquisition_cli.main([
+        "--config", str(config), "--no-viz",
+    ]) == 2
+    error = capsys.readouterr().err
+    assert "cup" in error
+    assert "add-object-offset" in error
 
 
 def test_offset_config_rejects_non_rigid_rotation(tmp_path: Path) -> None:
@@ -165,6 +263,22 @@ def test_preprocess_refuses_overwrite_and_double_processing(tmp_path: Path) -> N
     with pytest.raises(ObjectOffsetError, match="拒绝重复处理"):
         preprocess_hdf5(output, second, config_path=config)
     assert not second.exists()
+
+
+def test_preprocess_rejects_v3_to_preserve_interaction_coordinates(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "aligned_v3.h5"
+    output = tmp_path / "aligned_v3_obj.h5"
+    config = tmp_path / "offsets.yaml"
+    _write_source_h5(source)
+    _write_config(config)
+    with h5py.File(source, "r+") as h5:
+        h5.attrs["h5_version"] = "3.0"
+
+    with pytest.raises(ObjectOffsetError, match="object 坐标"):
+        preprocess_hdf5(source, output, config_path=config)
+    assert not output.exists()
 
 
 def test_viewer_applies_hdf5_object_pose_without_offset() -> None:

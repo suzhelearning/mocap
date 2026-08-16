@@ -191,16 +191,21 @@ def marker_colors(kinds, occluded) -> np.ndarray:
 
 
 def extract_hdf5(f: h5py.File) -> dict:
-    """从 HDF5 提取回放数据(全部入内存;22s 录段仅数 MB)。"""
+    """从 HDF5 提取回放数据。"""
     mocap = f.get("mocap")
-    if mocap is not None:
+    compact_v4 = str(f.attrs.get("h5_version", "")) == "4.0"
+    aligned_v3 = "timeline" in f
+    if compact_v4:
+        t_mocap = f["time_ns"][:].astype(np.int64)
+    elif aligned_v3:
+        t_mocap = f["timeline/t_phys_ns"][:].astype(np.int64)
+    elif mocap is not None:
         t_mocap = (
             mocap["t_aligned_ubuntu_ns"][:]
             if "t_aligned_ubuntu_ns" in mocap
             else mocap["t_ubuntu_ns"][:]
         ).astype(np.int64)
     elif "objects" in f and f["objects"]:
-        # 新 schema(双手 MANO + 物体):以物体刚体轴为参考时间轴
         t_mocap = next(iter(f["objects"].values()))["t_ubuntu_ns"][:].astype(np.int64)
     else:
         t_mocap = f["hands"]["left"]["t_ubuntu_ns"][:].astype(np.int64)
@@ -249,13 +254,18 @@ def extract_hdf5(f: h5py.File) -> dict:
             for _ in range(n)
         ]
 
-    # 双手骨架按自身时间戳对齐。MANO 表面只需要原始 21 点和一次性 beta；
-    # 16 关键点由 mano_skeleton 直接重排，不加载任何逐帧拟合缓存。
+    # 双手表面只需要世界系 21 点和一次性 beta。
     hands: dict[str, dict] = {}
     for side in ("left", "right"):
         g = f["hands"][side]
-        node_key = "mano_skeleton" if "mano_skeleton" in g else "nodes_global"
-        t_hand = g["t_ubuntu_ns"][:].astype(np.int64)
+        if compact_v4:
+            node_key = "keypoints_world"
+        else:
+            node_key = "mano_skeleton" if "mano_skeleton" in g else "nodes_global"
+        t_hand = (
+            t_mocap.copy() if compact_v4 or aligned_v3
+            else g["t_ubuntu_ns"][:].astype(np.int64)
+        )
         nodes = np.asarray(g[node_key][:])
         if nodes.ndim != 3 or nodes.shape[2] != 3:
             raise ValueError(
@@ -270,6 +280,10 @@ def extract_hdf5(f: h5py.File) -> dict:
             "t": t_hand,
             "nodes": nodes,
             "mano_beta": beta,
+            "valid": (
+                np.asarray(g["valid"][:], dtype=bool)
+                if "valid" in g else np.ones(len(t_hand), dtype=bool)
+            ),
         }
 
     # 命名物体刚体(新 schema 核心数据):名字 -> 帧列表
@@ -279,12 +293,19 @@ def extract_hdf5(f: h5py.File) -> dict:
             pos_key = "object_position" if "object_position" in g else "position"
             quat_key = ("object_quaternion_xyzw"
                         if "object_quaternion_xyzw" in g else "quaternion_xyzw")
+            object_t = (
+                t_mocap if compact_v4 or aligned_v3
+                else g["t_ubuntu_ns"][:].astype(np.int64)
+            )
             obj_frames[name] = [
                 (int(t), np.asarray(p, dtype=np.float64),
                  np.asarray(q, dtype=np.float64), bool(v))
                 for t, p, q, v in zip(
-                    g["t_ubuntu_ns"][:], g[pos_key][:],
-                    g[quat_key][:], g["tracking_valid"][:])
+                    object_t, g[pos_key][:],
+                    g[quat_key][:], (
+                        g["valid"][:] if "valid" in g
+                        else g["tracking_valid"][:]
+                    ))
             ]
 
     return {
@@ -294,6 +315,13 @@ def extract_hdf5(f: h5py.File) -> dict:
         "mk_frames": mk_frames,
         "hands": hands,
         "obj_frames": obj_frames,
+        "frame_valid": (
+            np.asarray(f["valid"][:], dtype=bool)
+            if compact_v4
+            else np.asarray(f["timeline/frame_valid"][:], dtype=bool)
+            if aligned_v3
+            else np.ones(n, dtype=bool)
+        ),
     }
 
 
@@ -456,11 +484,16 @@ def apply_frame(nodes: SceneNodes, data: dict, t_ns: float) -> dict:
     for side, h in data["hands"].items():
         j = nearest_idx(h["t"], t_ns)
         frame_nodes = h["nodes"][j]
-        nodes.hand_pc[side].points = frame_nodes
-        seg = np.asarray(
-            [[frame_nodes[c], frame_nodes[p]] for c, p in HAND_EDGES], np.float32
-        )
-        nodes.hand_ls[side].points = seg
+        visible = bool(h["valid"][j]) and bool(np.isfinite(frame_nodes).all())
+        nodes.hand_pc[side].visible = visible
+        nodes.hand_ls[side].visible = visible
+        if visible:
+            nodes.hand_pc[side].points = frame_nodes
+            seg = np.asarray(
+                [[frame_nodes[c], frame_nodes[p]] for c, p in HAND_EDGES],
+                np.float32,
+            )
+            nodes.hand_ls[side].points = seg
 
     return {"t": t_cur, "i": i, "n_mk": pts.shape[0]}
 
@@ -470,7 +503,11 @@ def probe_h5(path: Path) -> dict | None:
     try:
         with h5py.File(path, "r") as f:
             reject_external_links(f)
-            if "mocap" in f:
+            if "time_ns" in f:
+                t = f["time_ns"][:]
+            elif "timeline" in f:
+                t = f["timeline/t_phys_ns"][:]
+            elif "mocap" in f:
                 g = f["mocap"]
                 t = (g["t_aligned_ubuntu_ns"][:]
                      if "t_aligned_ubuntu_ns" in g else g["t_ubuntu_ns"][:])

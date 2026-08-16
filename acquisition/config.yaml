@@ -13,7 +13,7 @@ user: shd                           # 操作者:与 manus_pub.sh --user 一致;
 #   勿再按 Motive 名字改回。
 rigid_bodies:
   back: 1
-  objects:                         # 物体刚体 ID → 名字(采集时各物体单独建刚体)
+  objects:                         # 物体 ID→名；每个名称必须存在于 config/object_offsets.yaml
     cylinder: 3
 
 hands:
@@ -48,9 +48,13 @@ axis_transform:                    # Manus 骨架(z-up) → Motive 系(y-up) 轴
 
 recording:
   output_dir: "/home/current/data"   # 数据根目录;录制自动建 <日期>/ 子目录,文件名=时间
-  store_markers: true              # true=存原始 markers(vlen);false=只存刚体+手腕+手部
-  sample_hz: 60                    # 采集落盘目标频率(输入流 120Hz 时下采样;web 可动态改)
   chunk_frames: 4096               # HDF5 resize 批大小
+
+alignment:
+  output_hz: 60                    # 唯一公共物理时间轴，固定 60 Hz
+  latency_ms: 50                   # 等待目标时刻后的源样本再插值
+  mocap_max_gap_ms: 25             # Motive 包围样本间隔超过此值则该帧无效
+  manus_max_gap_ms: 35             # Manus 包围样本间隔超过此值则对应手无效
 
 keys:
   start: r                         # 空闲 → 开始录制

@@ -5,8 +5,8 @@
     pixi run record-noviz          # 不带可视化(纯采集)
 
 按键(默认):r 开始录制 / s 保存 / d 丢弃 / q 退出
-浏览器:http://<host>:8081(可视化模式)——「录制控制」面板同功能按钮,
-另有「采集频率」下拉可运行时改落盘采样率(默认 100Hz,输入流 120Hz 下采样)。
+浏览器:http://<host>:8081(可视化模式)——「录制控制」面板同功能按钮。
+所有数据由中央对齐器输出到一个固定 60Hz 公共物理时间轴。
 """
 
 from __future__ import annotations
@@ -19,17 +19,19 @@ import threading
 import time
 from pathlib import Path
 
-import numpy as np
 
+from .alignment import AlignedFrame, AlignmentEngine
 from .config import ConfigError, load_config
 from .keyboard import raw_keyboard
-from .kinematics import quat_xyzw_to_wxyz, quat_wxyz_to_xyzw
 from .live_view import StitchedScene
-from .manus_schema import manus_to_mediapipe, palm_node_index
-from .rate import RateGate
+from .object_offset import (
+    ObjectOffsetError,
+    load_object_offsets,
+    object_offsets_sha256,
+    require_object_offsets,
+)
 from .recorder import TakeWriter
 from .state_machine import TakeController
-from .stitching import extract_rigid_body, hand_nodes_to_global, stitch_hand
 from .streams import StreamHub
 
 FLUSH_INTERVAL = 0.5          # 录制缓冲落盘周期(秒)
@@ -88,110 +90,62 @@ def main(argv: list[str] | None = None) -> int:
     _cleanup_orphan_tmp(cfg.output_dir)
 
     hub = StreamHub(cfg.router_endpoint)
-    latest_hands: dict[str, dict | None] = {"left": None, "right": None}
-    latest_mano: dict[str, dict | None] = {"left": None, "right": None}
+    try:
+        configured_offsets = load_object_offsets()
+        active_offsets = require_object_offsets(
+            cfg.objects.keys(),
+            configured_offsets,
+        )
+        offset_sha256 = object_offsets_sha256()
+    except ObjectOffsetError as exc:
+        print(f"[错误] 物体外参加载失败: {exc}", file=sys.stderr)
+        return 2
+    alignment = AlignmentEngine(cfg, object_offsets=active_offsets)
+    latest_aligned: AlignedFrame | None = None
+    aligned_lock = threading.Lock()
     status_lock = threading.Lock()
-    stitched_lock = threading.Lock()
-    last_flush = time.time()
-    last_status = time.time()
+    last_flush = time.monotonic()
+    last_status = time.monotonic()
     no_data_hint_shown = False
 
-    # web 按钮命令队列(viser 回调线程 → 主循环 drain)+ 落盘频率门控
     command_q: queue.Queue[str] = queue.Queue()
-    rate_gate = RateGate(cfg.sample_hz)
-    current_object: dict[str, str] = {
-        "name": "cylinder" if "cylinder" in cfg.objects else next(iter(cfg.objects), ""),
-    }
-
-    def on_object(name: str) -> None:
-        current_object["name"] = name
-        sys.stdout.write(f"\n[物体] 当前操作物体: {name}\n")
-        sys.stdout.flush()
-
     viz: StitchedScene | None = None
     if not args.no_viz:
-        viz = StitchedScene(cfg, host=args.host,
-                            on_command=command_q.put,
-                            on_freq=rate_gate.set_hz,
-                            on_object=on_object)
+        viz = StitchedScene(
+            cfg,
+            host=args.host,
+            on_command=command_q.put,
+        )
         viz._show_markers = not args.no_markers
 
-    def writer_factory(take_id: int, path):
-        return TakeWriter(path, cfg, rate_gate=rate_gate)
+    def writer_factory(take_id: int, path: Path) -> TakeWriter:
+        return TakeWriter(
+            path,
+            cfg,
+            object_offset_sha256=offset_sha256,
+            object_pose_frames={
+                name: ("obj" if name in active_offsets else "motive_rigid")
+                for name in cfg.objects
+            },
+        )
 
     ctrl = TakeController(cfg, writer_factory, take_dir=cfg.output_dir)
 
-    # -- zenoh 回调(库线程,快速) -------------------------------------------
+    # 原始回调只更新对齐缓冲；主循环生成的统一帧才进入 HDF5。
     def on_mocap(frame: dict) -> None:
-        writer = ctrl.writer
-        if writer is not None:
-            writer.append_mocap(frame)
+        alignment.push_mocap(frame)
 
     def on_manus(side: str, msg: dict) -> None:
-        # 时间对齐:以本手套帧到达时刻为基准,对 mocap 刚体流插值,
-        # 消除双流帧周期错位(0~8.3ms → <1ms 级)
-        latest = hub.mocap_at(msg["t_ubuntu_ns"])
-        hcfg = cfg.hands[side]
-        edges = hub.latest_edges(side) or []
-        palm = palm_node_index(edges)
-        nodes = np.asarray(msg["nodes"], dtype=float)
-
-        if hcfg.wrist_rigid_id is not None:
-            # Motive 直接追踪手腕刚体:位姿直接用,跳过 back/offset
-            rb = extract_rigid_body(latest, hcfg.wrist_rigid_id) if latest else None
-            if rb is None or not rb[2]:
-                with stitched_lock:
-                    latest_hands[side] = None
-                    latest_mano[side] = None
-                return
-            p_w = np.asarray(rb[0], dtype=float)
-            q_w = quat_xyzw_to_wxyz(rb[1])
-            g = hand_nodes_to_global(nodes, palm, p_w, q_w, cfg.axis_matrix())
-            q_w_xyzw = quat_wxyz_to_xyzw(q_w)
-        else:
-            # 背部/手背刚体 + offset 推算手腕:必须用每只手自己的
-            # back_rigid_id(cfg.back_rigid_id 只是全局 back 渲染用),
-            # 否则左右手会绑定到同一刚体,一侧无数据
-            back = (extract_rigid_body(latest, hcfg.back_rigid_id)
-                    if latest and hcfg.back_rigid_id is not None else None)
-            if back is None or not back[2]:
-                with stitched_lock:
-                    latest_hands[side] = None
-                    latest_mano[side] = None
-                return
-            g, p_w, q_w_xyzw = stitch_hand(
-                nodes, palm, back[0], back[1], hcfg.wrist_offset, cfg.axis_matrix()
-            )
-
-        with stitched_lock:
-            latest_hands[side] = {
-                "nodes_global": g, "wrist_pos": p_w,
-                "wrist_quat_xyzw": q_w_xyzw,
-            }
-            latest_mano[side] = {
-                "keypoints_global": np.asarray(
-                    manus_to_mediapipe(g), dtype=float),
-            }
-        writer = ctrl.writer
-        if writer is not None:
-            writer.set_edges(side, edges)
-            writer.append_manus(
-                side, msg, p_w, q_w_xyzw,
-                np.asarray(manus_to_mediapipe(g), dtype=float),
-            )
-
+        alignment.push_manus(side, msg)
 
     hub.on_mocap(on_mocap)
-    hub.on_manus("left", lambda m: on_manus("left", m))
-    hub.on_manus("right", lambda m: on_manus("right", m))
+    hub.on_manus("left", lambda msg: on_manus("left", msg))
+    hub.on_manus("right", lambda msg: on_manus("right", msg))
 
     def _handle_cmd(ch: str) -> None:
-        """处理一个命令字符(键盘或 web 按钮,均为主线程调用,无竞态)。"""
-        if ch == cfg.keymap["save"] and ctrl.writer is not None:
-            health = hub.health_snapshot()
-            health["rate_gate"] = rate_gate.stats()
-            ctrl.writer.set_stream_health(health)
-            ctrl.writer.set_rigid_body_names(hub.rigid_body_names())
+        """处理键盘或 web 命令；只在主线程改变状态机。"""
+        if ch == cfg.keymap["start"] and ctrl.writer is None:
+            alignment.reset_timeline(time.monotonic_ns())
         changed = ctrl.handle(ch)
         if changed:
             sys.stdout.write(f"\n{ctrl.last_result or _status_text()}\n")
@@ -199,47 +153,65 @@ def main(argv: list[str] | None = None) -> int:
         if ctrl.quit_requested:
             stop.set()
 
-    # -- 主循环 tick(键盘轮询空隙执行) --------------------------------------
     def tick() -> None:
-        nonlocal last_flush, last_status, no_data_hint_shown
-        # 没有任何流到达时,一次性醒目提示(状态栏持续显示等待状态)
-        if not no_data_hint_shown and not any(hub.rates_hz().values()):
-            sys.stderr.write(
-                "[采集] ⏳ 等待设备启动:未收到动捕/手部数据流\n")
+        nonlocal last_flush, last_status, no_data_hint_shown, latest_aligned
+        while True:
+            try:
+                _handle_cmd(command_q.get_nowait())
+            except queue.Empty:
+                break
+        rates = hub.rates_hz()
+        if not no_data_hint_shown and not any(rates.values()):
+            sys.stderr.write("[采集] 等待设备启动：未收到动捕/手部数据流\n")
             sys.stderr.flush()
             no_data_hint_shown = True
-        now = time.time()
+
+        now_monotonic_ns = time.monotonic_ns()
+        for frame in alignment.emit_ready(now_monotonic_ns):
+            with aligned_lock:
+                latest_aligned = frame
+            writer = ctrl.writer
+            if writer is not None:
+                writer.append_aligned_frame(frame)
+
+        now = time.monotonic()
         writer = ctrl.writer
         if writer is not None and now - last_flush >= FLUSH_INTERVAL:
             writer.flush()
             last_flush = now
+
         if viz is not None:
-            edges = {s: hub.latest_edges(s) or [] for s in ("left", "right")}
-            calib_ids = {
-                rid
-                for name in ("left_wrist", "left_dip", "right_wrist", "right_dip")
-                if (rid := hub.rigid_body_id(name)) is not None
-            }
-            with stitched_lock:
-                hands_snapshot = dict(latest_hands)
-                mano_snapshot = dict(latest_mano)
-            viz.update(hub.latest_mocap(), hands_snapshot, edges,
-                       latest_mano=mano_snapshot,
-                       calib_rigid_ids=calib_ids,
-                       status=_status_fields(), state=ctrl.state)
+            with aligned_lock:
+                frame = latest_aligned
+            viz.update_aligned(
+                frame,
+                edges={
+                    side: hub.latest_edges(side) or []
+                    for side in ("left", "right")
+                },
+                calib_rigid_ids={
+                    rigid_id
+                    for name in (
+                        "left_wrist", "left_dip", "right_wrist", "right_dip",
+                    )
+                    if (rigid_id := hub.rigid_body_id(name)) is not None
+                },
+                status=_status_fields(),
+                state=ctrl.state,
+            )
         if now - last_status >= STATUS_INTERVAL:
             sys.stdout.write(f"\r\x1b[K{_status_text()}")
             sys.stdout.flush()
             last_status = now
 
     def _status_fields() -> dict[str, str]:
-        """状态栏拆分为独立字段(web 端各用独立 item,避免整块重排跳变)。"""
         rates = hub.rates_hz()
         with status_lock:
-            if not any(rates.values()):
-                ctrl_part = "⏳ 等待设备启动(未收到动捕/手部数据)"
-            else:
-                ctrl_part = ctrl.status_line()
+            ctrl_part = (
+                "等待设备启动(未收到动捕/手部数据)"
+                if not any(rates.values())
+                else ctrl.status_line()
+            )
             health = hub.health_snapshot()["streams"]
             losses = sum(
                 stream["sequence_gaps"]
@@ -252,16 +224,18 @@ def main(argv: list[str] | None = None) -> int:
                 "rate_mocap": f"动捕 {rates['mocap']:5.1f}Hz",
                 "rate_left": f"左手 {rates['left']:5.1f}Hz",
                 "rate_right": f"右手 {rates['right']:5.1f}Hz",
-                "sample": f"采集@{rate_gate.hz:.0f}Hz",
+                "sample": "统一时间轴@60Hz",
                 "health": f"异常/缺帧 {losses}",
                 "keys": "[r]录 [s]存 [d]丢 [q]退",
             }
 
     def _status_text() -> str:
-        """终端单行状态栏(与 web 字段同源)。"""
-        f = _status_fields()
-        return (f"{f['ctrl']}  |  {f['rate_mocap']}  {f['rate_left']}  {f['rate_right']}"
-                f"  |  {f['health']}  {f['sample']}  {f['keys']}")
+        fields = _status_fields()
+        return (
+            f"{fields['ctrl']}  |  {fields['rate_mocap']} "
+            f"{fields['rate_left']}  {fields['rate_right']}  |  "
+            f"{fields['health']}  {fields['sample']}  {fields['keys']}"
+        )
 
     def on_key(ch: str) -> None:
         _handle_cmd(ch)

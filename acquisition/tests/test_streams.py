@@ -87,6 +87,19 @@ def _mocap_frame(number: int) -> dict:
              "mean_error": 0.0004, "tracking_valid": True},
         ],
     }
+def _manus_frame(sequence: int, side: str) -> dict:
+    nodes = [[float(index), 0.0, 0.0] for index in range(25)]
+    return {
+        "glove_id": side,
+        "side": side,
+        "seq": sequence,
+        "source_monotonic_ns": time.monotonic_ns(),
+        "sdk_publish_time": sequence,
+        "nodes": nodes,
+        "node_quaternions_wxyz": [[1.0, 0.0, 0.0, 0.0] for _ in range(25)],
+    }
+
+
 
 
 def test_hub_receives_mocap_and_manus(router):
@@ -101,11 +114,14 @@ def test_hub_receives_mocap_and_manus(router):
         with _publisher() as session:
             for i in range(3):
                 session.put(FRAME_KEY, encode_frame(_mocap_frame(9_000_000 + i)))
-            nodes = [[float(j), 0.0, 0.0] for j in range(25)]
-            session.put(MANUS_RAW_KEYS[0], json.dumps(
-                {"glove_id": "a", "side": "left", "seq": 90001, "nodes": nodes}))
-            session.put(MANUS_RAW_KEYS[1], json.dumps(
-                {"glove_id": "b", "side": "right", "seq": 90002, "nodes": nodes}))
+            session.put(
+                MANUS_RAW_KEYS[0],
+                json.dumps(_manus_frame(90001, "left")),
+            )
+            session.put(
+                MANUS_RAW_KEYS[1],
+                json.dumps(_manus_frame(90002, "right")),
+            )
             session.put(MANUS_EDGE_KEYS[0], json.dumps(
                 {"glove_id": "a", "edges": [[1, 0, 13]]}))
 
@@ -123,6 +139,7 @@ def test_hub_receives_mocap_and_manus(router):
                    for i in range(3))
         mine = next(f for f in got["mocap"] if f["frame_number"] == 9_000_000)
         assert mine["t_ubuntu_ns"] > 0                    # 已打时间戳
+        assert mine["t_phys_ns"] > 0
         assert any(f["side"] == "left" and f["seq"] == 90001 for f in got["left"])
         left = next(f for f in got["left"] if f["seq"] == 90001)
         assert left["nodes"][1] == [1.0, 0.0, 0.0]
@@ -210,14 +227,13 @@ def test_callbacks_are_serialized_off_input_threads():
     hub._dispatch_thread = threading.Thread(
         target=hub._dispatch_loop, daemon=True)
     hub._dispatch_thread.start()
-    nodes = [[0.0, 0.0, 0.0] for _ in range(25)]
     for sequence in range(10):
         hub._on_mocap(_FakeSample(
             FRAME_KEY, encode_frame(_mocap_frame(sequence))))
-        hub._on_manus(_FakeSample(MANUS_RAW_KEYS[0], json.dumps({
-            "glove_id": "x", "side": "left",
-            "seq": sequence, "nodes": nodes,
-        })))
+        hub._on_manus(_FakeSample(
+            MANUS_RAW_KEYS[0],
+            json.dumps(_manus_frame(sequence, "left")),
+        ))
     hub.stop()
 
     assert received == 20
@@ -227,9 +243,10 @@ def test_callbacks_are_serialized_off_input_threads():
 def test_hub_ignores_unknown_side():
     """rawviz 异常输出的 Unknown 侧:忽略而非 KeyError(纯单元测试)。"""
     hub = StreamHub("tcp/127.0.0.1:7447")
-    nodes = [[0.0, 0.0, 0.0] for _ in range(25)]
-    hub._on_manus(_FakeSample("manus/raw_skeleton/unknown", json.dumps(
-        {"glove_id": "x", "side": "unknown", "seq": 1, "nodes": nodes})))
+    unknown = _manus_frame(1, "unknown")
+    hub._on_manus(_FakeSample(
+        "manus/raw_skeleton/unknown", json.dumps(unknown),
+    ))
     hub._on_edges(_FakeSample("manus/skeleton_edges/unknown", json.dumps(
         {"glove_id": "x", "edges": [[1, 0, 13]]})))
     # 未崩溃即通过;left/right 槽位未被污染
@@ -249,71 +266,13 @@ def test_hub_rejects_huge_edges():
 def test_hub_rejects_nan_manus():
     """含 NaN 的 manus 帧被拒绝(有限性校验)。"""
     hub = StreamHub("tcp/127.0.0.1:7447")
-    nodes = [[0.0, 0.0, 0.0] for _ in range(25)]
-    nodes[0][0] = float("nan")
-    hub._on_manus(_FakeSample(MANUS_RAW_KEYS[0], json.dumps(
-        {"glove_id": "x", "side": "left", "seq": 1, "nodes": nodes})))
+    message = _manus_frame(1, "left")
+    message["nodes"][0][0] = float("nan")
+    hub._on_manus(_FakeSample(
+        MANUS_RAW_KEYS[0], json.dumps(message),
+    ))
     assert hub.latest_manus("left") is None
 
-
-# -- mocap_at 时刻插值 ------------------------------------------------------
-
-def _rb(rid, pos, quat=(0.0, 0.0, 0.0, 1.0), valid=True):
-    return {"id": rid, "position": pos,
-            "quaternion_xyzw": list(quat),
-            "mean_error": 0.0004, "tracking_valid": valid}
-
-
-def _mocap_frame_at(t, *rbs):
-    fr = _mocap_frame(0)
-    fr["rigid_bodies"] = [dict(rb) for rb in rbs]
-    return t, fr
-
-
-def test_mocap_at_interpolates_position_and_quat():
-    """中点时刻:位置 lerp + 四元数 slerp 正确。"""
-    hub = StreamHub("tcp/127.0.0.1:7447")
-    q0 = (0.0, 0.0, 0.0, 1.0)                    # 恒等
-    q1 = (0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4))   # 绕 z 90°
-    hub._mocap_history.extend([
-        _mocap_frame_at(100, _rb(5, [0.0, 0.0, 0.0], q0)),
-        _mocap_frame_at(200, _rb(5, [0.2, 0.4, 0.0], q1)),
-    ])
-    mid = hub.mocap_at(150)                      # 中点
-    rb = next(r for r in mid["rigid_bodies"] if r["id"] == 5)
-    assert np.allclose(rb["position"], [0.1, 0.2, 0.0], atol=1e-6)
-    # 中点四元数 = 绕 z 45°
-    q = np.asarray(rb["quaternion_xyzw"])
-    assert np.allclose(q, [0.0, 0.0, np.sin(np.pi / 8), np.cos(np.pi / 8)], atol=1e-6)
-
-
-def test_mocap_at_out_of_range_takes_endpoint():
-    hub = StreamHub("tcp/127.0.0.1:7447")
-    hub._mocap_history.extend([
-        _mocap_frame_at(100, _rb(5, [0.1, 0.0, 0.0])),
-        _mocap_frame_at(200, _rb(5, [0.2, 0.0, 0.0])),
-    ])
-    assert hub.mocap_at(50)["rigid_bodies"][0]["position"] == [0.1, 0.0, 0.0]
-    assert hub.mocap_at(999)["rigid_bodies"][0]["position"] == [0.2, 0.0, 0.0]
-
-
-def test_mocap_at_rigid_appearing_in_one_frame_only():
-    """仅在一帧出现的刚体直接取该帧,不插值。"""
-    hub = StreamHub("tcp/127.0.0.1:7447")
-    hub._mocap_history.extend([
-        _mocap_frame_at(100, _rb(5, [0.1, 0.0, 0.0])),
-        _mocap_frame_at(200, _rb(5, [0.2, 0.0, 0.0]), _rb(7, [9.0, 9.0, 9.0])),
-    ])
-    rbs = {r["id"]: r for r in hub.mocap_at(150)["rigid_bodies"]}
-    assert rbs[7]["position"] == [9.0, 9.0, 9.0]   # 新出现,直接取
-    assert np.allclose(rbs[5]["position"], [0.15, 0.0, 0.0])
-
-
-def test_mocap_at_empty_history_returns_latest():
-    hub = StreamHub("tcp/127.0.0.1:7447")
-    hub._on_mocap(_FakeSample(FRAME_KEY, encode_frame(_mocap_frame(7))))
-    fr = hub.mocap_at(1_000_000_000_000)
-    assert fr["frame_number"] == 7
 
 
 def test_hub_rigid_body_names_mapping():

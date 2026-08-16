@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""replay_hdf5.py — HDF5 录制回放:按目标帧率插值合并多流,校验时间对齐。
+"""replay_hdf5.py - HDF5 录制回放与导出。
 
-插值:手部 30Hz 数据在动捕 120Hz 目标时间轴上做「位置 lerp + 四元数 slerp」,
-输出各目标时刻的双手全局节点、手腕位姿(含朝向)与动捕刚体,便于离线分析/驱动仿真。
+v4 文件直接读取紧凑的固定 60Hz 公共时间轴，不执行二次重采样。v3 与旧
+v1/v2 文件保留已有读取路径，供历史数据回放。
 
 安全防护:
 - 拒绝含外部链接的 HDF5(防恶意文件经 HDF5 外部链接读取任意本地文件)
@@ -124,18 +124,160 @@ def interpolate_rigid(g: h5py.Group, t_target: np.ndarray) -> tuple[np.ndarray, 
         q1 = _quat_xyzw_to_wxyz(quat[j1])
         out_quat[i] = _quat_wxyz_to_xyzw(slerp(q0, q1, frac))
     return out_pos, out_quat
+def replay_compact(f: h5py.File, json_path: str | None) -> int:
+    """读取 v4 紧凑公共时间轴，不执行二次插值。"""
+    t = np.asarray(f["time_ns"][:], dtype=np.int64)
+    if len(t) < 2:
+        print("统一时间轴不足 2 帧", file=sys.stderr)
+        return 1
+    valid = np.asarray(f["valid"][:], dtype=bool)
+    print(
+        f"统一时间轴: {len(t)} 帧, {(t[-1] - t[0]) / 1e9:.2f}s, "
+        f"有效率 {np.mean(valid):.1%}"
+    )
+    for side in ("left", "right"):
+        side_valid = np.asarray(f[f"hands/{side}/valid"][:], dtype=bool)
+        print(f"  {side}: {len(side_valid)} 帧, 有效率 {np.mean(side_valid):.1%}")
+    for name, group in f["objects"].items():
+        object_valid = np.asarray(group["valid"][:], dtype=bool)
+        print(
+            f"  object/{name}: {len(object_valid)} 帧, "
+            f"有效率 {np.mean(object_valid):.1%}"
+        )
+
+    if json_path:
+        def clean(value: np.ndarray) -> list:
+            array = np.asarray(value, dtype=float)
+            return np.where(np.isfinite(array), array, None).tolist()
+
+        with open(json_path, "w", encoding="utf-8") as out:
+            for index, t_ns in enumerate(t):
+                row: dict[str, object] = {
+                    "frame_index": index,
+                    "time_ns": int(t_ns),
+                    "valid": bool(valid[index]),
+                }
+                for side in ("left", "right"):
+                    group = f[f"hands/{side}"]
+                    row[side] = {
+                        "valid": bool(group["valid"][index]),
+                        "keypoints_world": clean(
+                            group["keypoints_world"][index],
+                        ),
+                        "wrist_position": clean(
+                            group["wrist_position"][index],
+                        ),
+                        "wrist_quaternion_xyzw": clean(
+                            group["wrist_quaternion_xyzw"][index],
+                        ),
+                    }
+                row["objects"] = {
+                    name: {
+                        "valid": bool(group["valid"][index]),
+                        "object_position": clean(
+                            group["object_position"][index],
+                        ),
+                        "object_quaternion_xyzw": clean(
+                            group["object_quaternion_xyzw"][index],
+                        ),
+                    }
+                    for name, group in f["objects"].items()
+                }
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"[json] 已写出 {json_path}")
+    return 0
+
+
+def replay_aligned(f: h5py.File, json_path: str | None) -> int:
+    """读取 v3 公共时间轴；不再对已经对齐的数据二次插值。"""
+    timeline = f["timeline"]
+    t = np.asarray(timeline["t_phys_ns"][:], dtype=np.int64)
+    if len(t) < 2:
+        print("统一时间轴不足 2 帧", file=sys.stderr)
+        return 1
+    valid = np.asarray(timeline["frame_valid"][:], dtype=bool)
+    print(
+        f"统一时间轴: {len(t)} 帧, {(t[-1] - t[0]) / 1e9:.2f}s, "
+        f"有效率 {np.mean(valid):.1%}"
+    )
+    for side in ("left", "right"):
+        side_valid = np.asarray(f[f"hands/{side}/valid"][:], dtype=bool)
+        print(f"  {side}: {len(side_valid)} 帧, 有效率 {np.mean(side_valid):.1%}")
+    for name, group in f["objects"].items():
+        object_valid = np.asarray(group["valid"][:], dtype=bool)
+        print(f"  object/{name}: {len(object_valid)} 帧, 有效率 {np.mean(object_valid):.1%}")
+
+    if json_path:
+        def clean(value: np.ndarray) -> list:
+            array = np.asarray(value, dtype=float)
+            return np.where(np.isfinite(array), array, None).tolist()
+
+        with open(json_path, "w", encoding="utf-8") as out:
+            for index, t_ns in enumerate(t):
+                row: dict[str, object] = {
+                    "frame_index": int(timeline["frame_index"][index]),
+                    "t_phys_ns": int(t_ns),
+                    "valid": bool(valid[index]),
+                    "reason_flags": int(timeline["reason_flags"][index]),
+                }
+                for side in ("left", "right"):
+                    group = f[f"hands/{side}"]
+                    row[side] = {
+                        "valid": bool(group["valid"][index]),
+                        "wrist_position": clean(group["wrist_position"][index]),
+                        "wrist_quaternion_xyzw": clean(
+                            group["wrist_quaternion_xyzw"][index]
+                        ),
+                        "mano_skeleton": clean(group["mano_skeleton"][index]),
+                    }
+                row["objects"] = {
+                    name: {
+                        "valid": bool(group["valid"][index]),
+                        "position": clean(group["object_position"][index]),
+                        "quaternion_xyzw": clean(
+                            group["object_quaternion_xyzw"][index]
+                        ),
+                    }
+                    for name, group in f["objects"].items()
+                }
+                row["interaction"] = {
+                    name: {
+                        side: clean(
+                            group[f"{side}_nodes_object"][index]
+                        )
+                        for side in ("left", "right")
+                    }
+                    for name, group in f["interaction"].items()
+                }
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"[json] 已写出 {json_path}")
+    return 0
+
+
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="HDF5 录制回放/插值校验")
     ap.add_argument("file", type=str)
-    ap.add_argument("--target-hz", type=float, default=120.0)
+    ap.add_argument("--target-hz", type=float, default=None,
+                    help="仅旧 H5 使用；v3 已固定 60Hz，不允许二次重采样")
     ap.add_argument("--json", type=str, default=None,
                     help="输出插值后 JSON(每行一个目标时刻帧),便于消费")
     args = ap.parse_args()
 
     with h5py.File(args.file, "r") as f:
         reject_external_links(f)                  # 防恶意 HDF5 外部链接
+        version = str(f.attrs.get("h5_version", ""))
+        if version == "4.0":
+            if args.target_hz is not None and not np.isclose(args.target_hz, 60.0):
+                print("v4 已是统一 60Hz，拒绝二次重采样", file=sys.stderr)
+                return 2
+            return replay_compact(f, args.json)
+        if version == "3.0":
+            if args.target_hz is not None and not np.isclose(args.target_hz, 60.0):
+                print("v3 已是统一 60Hz，拒绝二次重采样", file=sys.stderr)
+                return 2
+            return replay_aligned(f, args.json)
         mocap = f.get("mocap")
         if mocap is not None:
             mocap_time_key = (
@@ -160,13 +302,14 @@ def main() -> int:
         if not (np.isfinite(t0) and np.isfinite(t1) and t1 > t0):
             print(f"时间戳非法(t0={t0}, t1={t1})", file=sys.stderr)
             return 1
-        n_target = max(1, int(round((t1 - t0) / 1e9 * args.target_hz)))
+        target_hz = args.target_hz or 120.0
+        n_target = max(1, int(round((t1 - t0) / 1e9 * target_hz)))
         if n_target > MAX_TARGET_FRAMES:
             print(f"目标帧数 {n_target} 超上限 {MAX_TARGET_FRAMES},拒绝",
                   file=sys.stderr)
             return 1
         t_target = np.linspace(t0, t1, n_target)
-        print(f"目标时间轴: {t0}..{t1}ns, {n_target} 个时刻 @ {args.target_hz:.0f}Hz")
+        print(f"目标时间轴: {t0}..{t1}ns, {n_target} 个时刻 @ {target_hz:.0f}Hz")
 
         hands = {}
         for side in ("left", "right"):

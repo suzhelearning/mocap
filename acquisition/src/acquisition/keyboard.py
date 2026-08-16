@@ -4,7 +4,7 @@
     stop = threading.Event()
     raw_keyboard(on_key, stop)
 在 stop 前不返回;每个按键回调一次 on_key(chr)。退出时恢复终端。
-无按键时以 0.05s 间隔轮询(select 超时),供主循环做周期 flush/刷新。
+无按键时以 5ms 间隔轮询(select 超时),供 60Hz 对齐器、flush 和状态刷新。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from collections.abc import Callable
 
 KeyCallback = Callable[[str], None]
 
-POLL_INTERVAL = 0.05
+POLL_INTERVAL = 0.005
 
 
 def raw_keyboard(

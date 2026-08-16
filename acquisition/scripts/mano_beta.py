@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """mano_beta.py — 从手部关键点估计一次性 MANO beta 并写入 HDF5。
 
-每只手从最多 1000 个有效 ``mano_skeleton`` 帧稳健估计 ``mano_beta(10)``。
-逐帧表面直接由 ``mano_skeleton + mano_beta`` 驱动；不拟合、也不保存 pose、
-translation、scale、joints16 或 valid 等可派生数组。
+每只手从最多 1000 个有效 ``keypoints_world`` 帧稳健估计 ``mano_beta(10)``。
+逐帧表面直接由 ``keypoints_world + mano_beta`` 驱动；不拟合、也不保存 pose、
+translation、scale、joints16 或 valid 等派生数组。
 
 用法:
   pixi run mano-beta -- [<file-or-dir>] [--samples 1000] [--force]
@@ -37,7 +37,7 @@ class SideEstimate:
     segment_rms_mm: float
 
 
-# 旧版逐帧拟合缓存；新契约可由 mano_skeleton + mano_beta 确定性派生。
+# 旧版逐帧拟合缓存；当前契约可由 keypoints_world + mano_beta 确定性派生。
 _LEGACY_DERIVED_FIELDS = (
     "mano_pose",
     "mano_translation",
@@ -77,7 +77,10 @@ def _load_skeleton(
         group = None if hands is None else hands.get(side)
         if group is None:
             return None, f"缺少 hands/{side}"
-        if "mano_skeleton" in group:
+        if "keypoints_world" in group:
+            skeleton = np.asarray(group["keypoints_world"][:], dtype=np.float64)
+            source = "keypoints_world"
+        elif "mano_skeleton" in group:
             skeleton = np.asarray(group["mano_skeleton"][:], dtype=np.float64)
             source = "mano_skeleton"
         elif "nodes_global" in group:
@@ -87,7 +90,9 @@ def _load_skeleton(
             skeleton = nodes[:, np.asarray(MEDIAPIPE_FROM_MANUS), :]
             source = "nodes_global(25→21)"
         else:
-            return None, f"hands/{side} 缺少 mano_skeleton 或 nodes_global"
+            return None, (
+                f"hands/{side} 缺少 keypoints_world/mano_skeleton/nodes_global"
+            )
     if skeleton.ndim != 3 or skeleton.shape[1:] != (21, 3):
         return None, f"hands/{side} 骨架形状 {skeleton.shape} 不是 (N,21,3)"
     return skeleton, source

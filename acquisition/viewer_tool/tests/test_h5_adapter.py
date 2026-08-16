@@ -16,31 +16,55 @@ class H5AdapterTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.path = self.root / "take001.h5"
-        timestamps = np.asarray([1_000_000_000, 1_010_000_000, 1_020_000_000], dtype=np.int64)
+        timestamps = np.asarray(
+            [1_000_000_000, 1_016_666_667, 1_033_333_333],
+            dtype=np.int64,
+        )
         with h5py.File(self.path, "w") as f:
+            f.attrs["h5_version"] = "4.0"
+            f.create_dataset("time_ns", data=timestamps)
+            f.create_dataset("valid", data=np.ones(3, dtype=np.uint8))
             hands = f.create_group("hands")
             for side in ("left", "right"):
                 group = hands.create_group(side)
-                group.create_dataset("t_ubuntu_ns", data=timestamps)
                 group.create_dataset(
-                    "mano_skeleton",
+                    "keypoints_world",
                     data=np.zeros((3, 21, 3), dtype=np.float32),
                 )
+                group.create_dataset(
+                    "wrist_position",
+                    data=np.zeros((3, 3), dtype=np.float32),
+                )
+                group.create_dataset(
+                    "wrist_quaternion_xyzw",
+                    data=np.tile(
+                        np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+                        (3, 1),
+                    ),
+                )
+                group.create_dataset("valid", data=np.ones(3, dtype=np.uint8))
                 group.create_dataset(
                     "mano_beta", data=np.zeros(10, dtype=np.float32),
                 )
             objects = f.create_group("objects")
             cylinder = objects.create_group("cylinder")
-            cylinder.create_dataset("t_ubuntu_ns", data=timestamps)
             cylinder.create_dataset(
-                "position", data=np.zeros((3, 3), dtype=np.float64)
+                "object_position", data=np.zeros((3, 3), dtype=np.float32),
             )
             cylinder.create_dataset(
-                "quaternion_xyzw",
-                data=np.tile([0.0, 0.0, 0.0, 1.0], (3, 1)),
+                "object_quaternion_xyzw",
+                data=np.tile(
+                    np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+                    (3, 1),
+                ),
             )
-            cylinder.create_dataset(
-                "tracking_valid", data=np.asarray([True, True, True])
+            cylinder.create_dataset("valid", data=np.ones(3, dtype=np.uint8))
+            events = f.create_group("events")
+            events.create_dataset(
+                "frame_index", data=np.asarray([0, 3], dtype=np.int64),
+            )
+            events.create_dataset(
+                "type", data=np.asarray([0, 3], dtype=np.uint8),
             )
 
         adapter_path = Path(__file__).resolve().parents[2] / "scripts" / "h5_viewer_adapter.py"

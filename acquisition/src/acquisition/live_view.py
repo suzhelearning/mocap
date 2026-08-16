@@ -6,7 +6,7 @@ UI 风格参考 NatNetViewerSource/src/natnet_zenoh/viewer.py:
 - 可折叠 folder:「录制控制」「视图」「桌面」
 - Marker 按跟踪状态配色(id_kind/occluded 红)
 - y-up 场景 + 桌面道具(操作物体场景参考)
-- 保留采集特有元素:双手骨架(chain 配色)、手腕/物体刚体、录制按钮/采集频率
+- 保留采集特有元素:双手骨架(chain 配色)、手腕/物体刚体、录制按钮/对齐状态
 
 手骨架配色常量复制自 manus/viz.py(manus 不是包,不可 import),来源已注明。
 Frame 的姿态要求 wxyz 序,与协议 xyzw 互转。
@@ -21,12 +21,12 @@ import numpy as np
 import viser
 import socket
 
+from .alignment import AlignedFrame
 from .config import Config
 from .kinematics import quat_xyzw_to_wxyz
 from .viser_core import load_object_mesh
 from .state_machine import State
 
-FREQ_OPTIONS = ("30", "60", "100", "120")
 
 # 手指链配色(复制自 manus/viz.py)5=拇指 6=食指 7=中指 8=无名指 9=小指 13=手掌
 CHAIN_COLORS = {
@@ -170,14 +170,8 @@ class StitchedScene:
         host: str = "127.0.0.1",
         port: int | None = None,
         on_command: Callable[[str], None] | None = None,
-        on_freq: Callable[[float], None] | None = None,
-        on_object: Callable[[str], None] | None = None,
     ) -> None:
-        """on_command: 录制按钮点击回调(发 keymap 字符,线程安全队列)。
-        on_freq: 采集频率下拉变更回调(线程安全 RateGate.set_hz)。
-        on_object: 操作物体下拉变更回调(线程安全,仅存变量)。
-        都在 viser 回调线程执行,实现须线程安全。
-        """
+        """on_command 由 viser 回调线程执行，只允许线程安全入队。"""
         self._cfg = config
         self._port = port or config.viz_port
         # 固定端口:冲突直接报错(viser 内部端口被占会静默 +1,采集页地址会漂移)
@@ -189,8 +183,6 @@ class StitchedScene:
                     f"viz 端口 {self._port} 已被占用,请先释放: ss -ltnp | grep {self._port}"
                 )
         self._on_command = on_command or (lambda ch: None)
-        self._on_freq = on_freq or (lambda hz: None)
-        self._on_object = on_object or (lambda name: None)
         self._last_state: State | None = None
         self.server = viser.ViserServer(host=host, port=self._port)
 
@@ -315,8 +307,7 @@ class StitchedScene:
     def _build_controls(self) -> None:
         """三个可折叠 folder:录制控制 / 视图 / 桌面。
 
-        回调均为 async def(viser 事件循环执行),体内只做线程安全的
-        转发(on_command → 主循环命令队列,on_freq → RateGate 锁内赋值)。
+        回调均只把录制命令转发给主循环。
         """
         keymap = self._cfg.keymap
         # 布局:录制控制(0) → 状态 items(1-6) → 视图(10) → 桌面(11)
@@ -327,20 +318,6 @@ class StitchedScene:
                 "保存", color=(31, 119, 180), hint=f"键盘键 {keymap['save']!r}")
             self._btn_discard = self.server.gui.add_button(
                 "丢弃", color=(214, 39, 40), hint=f"键盘键 {keymap['discard']!r}")
-            default_freq = str(int(self._cfg.sample_hz))
-            if default_freq not in FREQ_OPTIONS:
-                default_freq = "60"
-            self._freq = self.server.gui.add_dropdown(
-                "采集频率 (Hz)", FREQ_OPTIONS, initial_value=default_freq,
-                hint="录制落盘目标频率(输入流 120Hz 时下采样)")
-            # 操作物体选择(默认 cylinder,config.objects 中不存在则取第一个)
-            obj_options = list(self._cfg.objects.keys())
-            default_obj = "cylinder" if "cylinder" in obj_options else (
-                obj_options[0] if obj_options else "")
-            self._object_select = self.server.gui.add_dropdown(
-                "操作物体", obj_options or [""],
-                initial_value=default_obj or (obj_options[0] if obj_options else ""),
-                hint="当前操作物体(选中项随录制记录,后期扩展)")
 
         with self.server.gui.add_folder("视图", order=10):
             self._marker_size = self.server.gui.add_slider(
@@ -382,9 +359,6 @@ class StitchedScene:
         async def _on_discard(_e):
             self._on_command(keymap["discard"])
 
-        self._freq.on_update(lambda _e: self._on_freq(float(self._freq.value)))
-        self._object_select.on_update(
-            lambda _e: self._on_object(str(self._object_select.value)))
         self._marker_size.on_update(lambda _e: self._apply_marker_style())
         self._show_markers_cb.on_update(lambda _e: setattr(self, "_show_markers",
                                                            self._show_markers_cb.value))
@@ -489,6 +463,59 @@ class StitchedScene:
             handle.visible = self._show_table.value
 
     # -- 更新 -------------------------------------------------------------
+
+    def update_aligned(
+        self,
+        frame: AlignedFrame | None,
+        *,
+        edges: dict[str, list[tuple[int, int, int]]],
+        calib_rigid_ids: set[int] | None = None,
+        status: dict[str, str] | None = None,
+        state: State | None = None,
+    ) -> None:
+        """只消费一个统一帧；物体、左右手绝不从不同时间索引拼接。"""
+        if frame is None:
+            self.update(
+                None, {}, edges, latest_mano={},
+                calib_rigid_ids=calib_rigid_ids, status=status, state=state,
+            )
+            return
+        mocap = None
+        if frame.mocap_frame is not None:
+            mocap = dict(frame.mocap_frame)
+            bodies = [dict(body) for body in mocap.get("rigid_bodies", [])]
+            by_id = {int(body["id"]): body for body in bodies}
+            for name, rigid_id in self._cfg.objects.items():
+                obj = frame.objects[name]
+                body = by_id.get(rigid_id)
+                if body is not None:
+                    body["position"] = obj.object_position
+                    body["quaternion_xyzw"] = obj.object_quaternion_xyzw
+                    body["tracking_valid"] = obj.valid
+            mocap["rigid_bodies"] = bodies
+        hands = {
+            side: {
+                "nodes_global": hand.nodes_world,
+                "wrist_pos": hand.wrist_position,
+                "wrist_quat_xyzw": hand.wrist_quaternion_xyzw,
+            }
+            for side, hand in frame.hands.items()
+            if hand.valid
+        }
+        mano = {
+            side: {"keypoints_global": hand.mano_skeleton}
+            for side, hand in frame.hands.items()
+            if hand.valid
+        }
+        self.update(
+            mocap,
+            hands,
+            edges,
+            latest_mano=mano,
+            calib_rigid_ids=calib_rigid_ids,
+            status=status,
+            state=state,
+        )
 
     def update(
         self,

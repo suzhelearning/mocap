@@ -52,8 +52,10 @@ class Config:
     axis_permutation: tuple[int, int, int]
     axis_signs: tuple[int, int, int]
     output_dir: Path
-    store_markers: bool
-    sample_hz: float               # 采集落盘目标频率(输入 120Hz 时默认降到 60Hz)
+    alignment_hz: float            # 中央统一时间轴频率；当前契约固定 60 Hz
+    alignment_latency_ms: float    # 实时插值固定缓冲延迟
+    mocap_max_gap_ms: float        # Motive 插值允许的最大包围样本间隔
+    manus_max_gap_ms: float        # Manus 插值允许的最大包围样本间隔
     keymap: dict[str, str]
     viz_port: int
     chunk_frames: int
@@ -191,11 +193,28 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(rec, dict):
         raise ConfigError("recording 必须是映射")
     output_dir = Path(rec.get("output_dir", "captures"))
-    store_markers = bool(rec.get("store_markers", True))
-    sample_hz = float(rec.get("sample_hz", 60.0))
-    if not (sample_hz > 0 and sample_hz <= 10000):
-        raise ConfigError(f"recording.sample_hz 必须是正数,实际 {sample_hz}")
     chunk_frames = int(rec.get("chunk_frames", 4096))
+    if chunk_frames <= 0:
+        raise ConfigError("recording.chunk_frames 必须是正整数")
+
+    alignment = raw.get("alignment", {})
+    if not isinstance(alignment, dict):
+        raise ConfigError("alignment 必须是映射")
+    alignment_hz = float(alignment.get("output_hz", 60.0))
+    if not np.isclose(alignment_hz, 60.0):
+        raise ConfigError(
+            f"alignment.output_hz 当前固定为 60，实际 {alignment_hz}"
+        )
+    alignment_latency_ms = float(alignment.get("latency_ms", 50.0))
+    mocap_max_gap_ms = float(alignment.get("mocap_max_gap_ms", 25.0))
+    manus_max_gap_ms = float(alignment.get("manus_max_gap_ms", 35.0))
+    for label, value in (
+        ("latency_ms", alignment_latency_ms),
+        ("mocap_max_gap_ms", mocap_max_gap_ms),
+        ("manus_max_gap_ms", manus_max_gap_ms),
+    ):
+        if not np.isfinite(value) or value <= 0:
+            raise ConfigError(f"alignment.{label} 必须是正有限数，实际 {value}")
 
     keys_raw = raw.get("keys", {})
     keymap = {k: str(v) for k, v in DEFAULT_KEYMAP.items()}
@@ -220,8 +239,10 @@ def load_config(path: str | Path) -> Config:
         axis_permutation=tuple(perm),
         axis_signs=tuple(signs),
         output_dir=output_dir,
-        store_markers=store_markers,
-        sample_hz=sample_hz,
+        alignment_hz=alignment_hz,
+        alignment_latency_ms=alignment_latency_ms,
+        mocap_max_gap_ms=mocap_max_gap_ms,
+        manus_max_gap_ms=manus_max_gap_ms,
         keymap=keymap,
         viz_port=viz_port,
         chunk_frames=chunk_frames,
@@ -289,8 +310,10 @@ def _merge_user_offset(cfg: Config) -> Config:
         axis_permutation=cfg.axis_permutation,
         axis_signs=cfg.axis_signs,
         output_dir=cfg.output_dir,
-        store_markers=cfg.store_markers,
-        sample_hz=cfg.sample_hz,
+        alignment_hz=cfg.alignment_hz,
+        alignment_latency_ms=cfg.alignment_latency_ms,
+        mocap_max_gap_ms=cfg.mocap_max_gap_ms,
+        manus_max_gap_ms=cfg.manus_max_gap_ms,
         keymap=cfg.keymap,
         viz_port=cfg.viz_port,
         chunk_frames=cfg.chunk_frames,

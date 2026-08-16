@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""zenoh_pub.py — Manus raw 骨架 → Zenoh 发布器
+"""zenoh_pub.py — Manus raw 骨架 → Zenoh 发布器。
 
-从 stdin 读取 rawviz 协议（HAND/EDGE/POS，左右手独立流），发布到 Zenoh：
+从 stdin 读取 rawviz 的 HAND/EDGE/POSE 协议。每个 POSE 同时携带：
+- 25 个局部节点位置；
+- 25 个局部节点四元数（wxyz）；
+- rawviz SDK 回调入口的 Linux monotonic 纳秒；
+- Manus SDK 原始 publishTime。
 
-  manus/raw_skeleton/<side>        每手套独立流:每帧 25 节点位置（JSON 或 --binary）
-  manus/skeleton_edges/<side>      骨骼连接（child,parent,chainType），周期重发
-
-左右手完全解耦（类似 ROS 双 topic）:每只手独立 seq、独立发布,
-一只遮挡/无数据不影响另一只。
+发布：
+  manus/raw_skeleton/<side>        每手套独立位姿流（JSON 或 --binary）
+  manus/skeleton_edges/<side>      骨骼连接（child,parent,chainType）
 
 用法:
-    ./rawviz.out | python zenoh_pub.py                  # JSON（默认，跨语言易解析）
-    ./rawviz.out | python zenoh_pub.py --binary         # float32 二进制（300B/帧）
+    ./rawviz.out | python zenoh_pub.py
+    ./rawviz.out | python zenoh_pub.py --binary
     ./rawviz.out | python zenoh_pub.py --router tcp/localhost:7447
-                                                        # 通过 zenohd 路由器（跨网络）
-
-订阅验证:  python zenoh_sub.py
 """
+
 
 import argparse
 import json
@@ -28,6 +28,7 @@ import zenoh
 
 MAX_NODE_COUNT = 64              # rawviz 上报节点数上限(正常 25),防畸形设备数据
 EDGE_REPUBLISH_PERIOD = 300      # 拓扑重发周期(seq 差值),让后启动的订阅者也能收到
+BINARY_MAGIC = b"MNS1"
 
 
 
@@ -39,9 +40,17 @@ class ZenohPublisher:
 
     def put(self, session, key, obj):
         if self.binary and isinstance(obj, dict) and "nodes" in obj:
-            vals = [v for p in obj["nodes"] for v in p]
-            if len(vals) == 75:        # 25 节点契约;其他节点数回退 JSON
-                payload = struct.pack("<75f", *vals)
+            nodes = [v for p in obj["nodes"] for v in p]
+            rotations = [v for q in obj["node_quaternions_wxyz"] for v in q]
+            if len(nodes) == 75 and len(rotations) == 100:
+                payload = struct.pack(
+                    "<4sQQQ175f",
+                    BINARY_MAGIC,
+                    int(obj["seq"]),
+                    int(obj["source_monotonic_ns"]),
+                    int(obj["sdk_publish_time"]),
+                    *(nodes + rotations),
+                )
             else:
                 payload = json.dumps(obj)
         else:
@@ -101,27 +110,36 @@ class ZenohPublisher:
                 if 0 <= child < h["node_count"] and 0 <= parent < h["node_count"]:
                     h["edges"].append([child, parent, chain])
 
-        elif tag == "POS" and len(parts) >= 5:
-            # POS <gloveId> <seq> <x0 y0 z0 ...>:每手套独立流,收到即发布
+        elif tag == "POSE" and len(parts) >= 5:
+            # POSE <gid> <seq> <source_monotonic_ns> <sdk_publish_time>
+            #      25 × <x y z qw qx qy qz>
             gid = parts[1]
             h = self.hands.get(gid)
             if h:
                 try:
                     seq = int(parts[2])
-                    vals = [float(v) for v in parts[3:3 + h["node_count"] * 3]]
+                    source_monotonic_ns = int(parts[3])
+                    sdk_publish_time = int(parts[4])
+                    values = [
+                        float(v) for v in parts[5:5 + h["node_count"] * 7]
+                    ]
                 except ValueError:
-                    print(f"[pub] 坏 POS 行(非数字),跳过: {line.strip()}", file=sys.stderr)
+                    print(f"[pub] 坏 POSE 行(非数字),跳过: {line.strip()}",
+                          file=sys.stderr)
                     return
-                if len(vals) == h["node_count"] * 3:
-                    nodes = [vals[i:i + 3] for i in range(0, len(vals), 3)]
+                if len(values) == h["node_count"] * 7:
+                    rows = [
+                        values[i:i + 7] for i in range(0, len(values), 7)
+                    ]
                     self.put(session, f"manus/raw_skeleton/{h['side']}", {
                         "glove_id": gid,
                         "side": h["side"],
                         "seq": seq,
-                        "nodes": nodes,
+                        "source_monotonic_ns": source_monotonic_ns,
+                        "sdk_publish_time": sdk_publish_time,
+                        "nodes": [row[:3] for row in rows],
+                        "node_quaternions_wxyz": [row[3:] for row in rows],
                     })
-                    # 拓扑重发:首帧立即发；seq 回绕/rawviz 重启立即发；
-                    # 后续按上一次“拓扑发送序号”计周期，不能用逐帧 last_seq。
                     last_seq = h["last_seq"]
                     last_edges_seq = h["last_edges_seq"]
                     wrapped = last_seq is not None and seq < last_seq

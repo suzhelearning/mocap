@@ -60,10 +60,10 @@ bash record.sh                      # http://127.0.0.1:8081
 |---|---|---|
 | `manus_pub.sh` | 手套发布(rawviz \| zenoh_pub,120Hz);`--user <名>` 选人校准(缺失报错) | Ctrl-C 即停;dongle 独占 |
 | `windows_pub.sh` | Windows motive 发布(ssh 会话挂载) | 断开 ssh + 主动停 Windows 进程 |
-| `record.sh` | 采集程序(web 8081 + 录制按钮 + 采集频率) | q / Ctrl-C,录制中先丢弃 |
+| `record.sh` | 采集程序(web 8081 + 录制按钮 + 固定 60Hz 公共时间轴) | q / Ctrl-C,录制中先丢弃 |
 
-web 左侧「录制控制」按钮与键盘(r/s/d)等价;「采集频率」下拉默认
-100Hz 可运行时调。
+web 左侧「录制控制」按钮与键盘(r/s/d)等价。输出固定 60 Hz；Motive、左右 Manus、
+手腕、物体和交互字段逐行共享同一物理时间戳。
 
 常用命令(`cd` 到对应子目录后):
 
@@ -71,6 +71,7 @@ web 左侧「录制控制」按钮与键盘(r/s/d)等价;「采集频率」下�
 |---|---|---|
 | `mocap/` | `pixi run view / subscribe / test` | 动捕可视化/消费/测试 |
 | `mocap/acquisition/` | `pixi run record / inspect / replay / test` | 采集/检查/回放/测试 |
+| `mocap/acquisition/` | `pixi run add-object-offset -- <object> --gl-mm X Y Z --go-deg P Y R` | 写入 Motive Visuals 物体外参 |
 | `mocap/acquisition/` | `pixi run python scripts/e2e_check.py --seconds 5` | 端到端验证(需真实流) |
 
 ## 关键说明

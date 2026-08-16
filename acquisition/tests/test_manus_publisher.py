@@ -24,9 +24,11 @@ class _Session:
         self.rows.append((key, json.loads(payload)))
 
 
-def _pos(seq: int) -> str:
-    values = " ".join(str(float(i)) for i in range(75))
-    return f"POS glove {seq} {values}"
+def _pose(seq: int) -> str:
+    row = "0 0 0 1 0 0 0"
+    return f"POSE glove {seq} {1_000_000_000 + seq} {seq} " + " ".join(
+        [row] * 25
+    )
 
 
 def test_edges_republish_uses_last_edge_sequence_not_last_frame():
@@ -35,9 +37,9 @@ def test_edges_republish_uses_last_edge_sequence_not_last_frame():
     pub.handle_line(session, "HAND glove right 25")
     pub.handle_line(session, "EDGE glove 2 1 6")
 
-    pub.handle_line(session, _pos(10))
-    pub.handle_line(session, _pos(11))
-    pub.handle_line(session, _pos(10 + EDGE_PERIOD))
+    pub.handle_line(session, _pose(10))
+    pub.handle_line(session, _pose(11))
+    pub.handle_line(session, _pose(10 + EDGE_PERIOD))
 
     edges = [row for row in session.rows if row[0].startswith("manus/skeleton_edges/")]
     assert len(edges) == 2
@@ -49,8 +51,8 @@ def test_sequence_wrap_immediately_republishes_edges():
     session = _Session()
     pub.handle_line(session, "HAND glove left 25")
     pub.handle_line(session, "EDGE glove 2 1 5")
-    pub.handle_line(session, _pos(100))
-    pub.handle_line(session, _pos(1))
+    pub.handle_line(session, _pose(100))
+    pub.handle_line(session, _pose(1))
 
     edges = [row for row in session.rows if row[0].startswith("manus/skeleton_edges/")]
     assert len(edges) == 2
@@ -60,10 +62,13 @@ def test_each_position_frame_publishes_only_one_skeleton_payload():
     pub = ZenohPublisher()
     session = _Session()
     pub.handle_line(session, "HAND glove left 25")
-    pub.handle_line(session, _pos(7))
+    pub.handle_line(session, _pose(7))
 
     skeleton_keys = [
         key for key, _payload in session.rows
         if "skeleton" in key and "edges" not in key
     ]
     assert skeleton_keys == ["manus/raw_skeleton/left_hand"]
+    payload = session.rows[-2][1]
+    assert payload["source_monotonic_ns"] == 1_000_000_007
+    assert len(payload["node_quaternions_wxyz"]) == 25

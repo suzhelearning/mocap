@@ -90,9 +90,9 @@ class Hand:
 # ---------------------------------------------------------------------------
 
 def handle_line(line, hands):
-    """返回 True 表示有新骨架数据(POS 行),调用方据此刷新场景。
+    """返回 True 表示有新骨架数据（POSE 行）。
 
-    POS 协议(独立流): POS <gloveId> <seq> <x0 y0 z0 ...>
+    POSE:gid/seq/source_monotonic/sdk_publish_time 后接每节点 xyz+四元数。
     """
     parts = line.split()
     if not parts:
@@ -109,12 +109,14 @@ def handle_line(line, hands):
             h = hands.get(parts[1])
             if h:
                 h.add_edge(int(parts[2]), int(parts[3]), int(parts[4]))
-        elif tag == "POS" and len(parts) >= 5:
+        elif tag == "POSE" and len(parts) >= 5:
             h = hands.get(parts[1])
             if h:
-                vals = np.asarray(parts[3:3 + h.node_count * 3], dtype=float)
-                if vals.size == h.node_count * 3:
-                    h.pos = vals.reshape(h.node_count, 3)
+                vals = np.asarray(
+                    parts[5:5 + h.node_count * 7], dtype=float,
+                )
+                if vals.size == h.node_count * 7:
+                    h.pos = vals.reshape(h.node_count, 7)[:, :3]
                     h.valid = True
                     return True
     except ValueError:

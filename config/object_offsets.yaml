@@ -5,7 +5,7 @@ objects:
   cylinder:
     motive_rigid_from_obj:
       translation_m: [-0.010, 0.0, 0.0]
-      # Rz(-90°) @ Rx(175°) @ Ry(0°)
+      # Motive Visuals: GL XYZ [mm]=[-10,0,0]；GO Pitch/Yaw/Roll [deg]=[175,0,-90]
       rotation_matrix:
         - [0.0, -0.9961946980917455, -0.0871557427476582]
         - [-1.0, 0.0, 0.0]

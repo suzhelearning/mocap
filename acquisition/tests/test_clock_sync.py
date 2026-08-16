@@ -1,4 +1,4 @@
-"""跨机 wall-clock 偏移、漂移与抖动下包络估计测试。"""
+"""独立源单调时钟偏移、漂移与网络抖动下包络估计测试。"""
 
 from __future__ import annotations
 

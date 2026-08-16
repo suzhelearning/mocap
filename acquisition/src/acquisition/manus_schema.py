@@ -1,16 +1,15 @@
 """Manus 消息解析/校验 + 骨骼拓扑。
 
 线格式事实来源:manus/zenoh_pub.py
-- manus/raw_skeleton/<hand>   JSON {glove_id, side, seq, nodes: 25×[x,y,z]}
-                             或 --binary: 75 个 little-endian float32(25 节点 × xyz)
-- manus/skeleton_edges/<hand> JSON {glove_id, edges: [child, parent, chainType]}(0-based)
-<hand> ∈ {left_hand, right_hand}:Manus 侧命名,与 Motive 的
-left_wrist/right_wrist(手腕刚体)区分——本模块内部统一归一化为 left/right。
+- JSON: {glove_id, side, seq, source_monotonic_ns, sdk_publish_time,
+         nodes: 25×[x,y,z], node_quaternions_wxyz: 25×[w,x,y,z]}
+- binary: ``MNS1`` 头 + seq/source/sdk 时间 + 75 位置 float32 + 100 旋转 float32
+- manus/skeleton_edges/<hand>:JSON {glove_id, edges:[child,parent,chainType]}
 
-节点语义(manus/viz.py):节点 0 为手掌 root(chainType 13);手指链
-5=拇指 6=食指 7=中指 8=无名指 9=小指。消息无时间戳 → 采集端打点。
+<hand> ∈ {left_hand, right_hand}；模块内部归一化为 left/right。
+节点 0 为手掌 root。位置与旋转均为 Manus 局部骨架系；统一时间轴阶段
+先在此局部系插值，再与同一物理时刻的 Motive 手腕位姿拼接。
 """
-
 from __future__ import annotations
 
 import json
@@ -20,6 +19,9 @@ import struct
 NODE_COUNT = 25
 CHAIN_PALM = 13
 MAX_EDGES = 64                # 骨骼边数量上限(正常 ~30 条;防不受信注入超大列表)
+BINARY_MAGIC = b"MNS1"
+BINARY_FORMAT = "<4sQQQ175f"
+BINARY_SIZE = struct.calcsize(BINARY_FORMAT)
 
 # Manus 手骨架 topic(左手/右手独立流,类似 ROS 双 topic)
 MANUS_RAW_KEYS = ("manus/raw_skeleton/left_hand", "manus/raw_skeleton/right_hand")
@@ -72,10 +74,7 @@ class ManusError(ValueError):
 
 
 def decode_manus(payload: bytes | str) -> dict:
-    """解码一条 raw_skeleton 消息(JSON 或 --binary 二进制),校验后返回 dict。
-
-    返回 {glove_id, side, seq, nodes: list[list[float]]}。失败抛 ManusError。
-    """
+    """解码并严格校验一条 raw_skeleton 位姿消息。"""
     try:
         text = payload.decode("utf-8") if isinstance(payload, bytes) else payload
     except UnicodeDecodeError:
@@ -87,24 +86,62 @@ def decode_manus(payload: bytes | str) -> dict:
         except json.JSONDecodeError as exc:
             raise ManusError(f"raw_skeleton JSON 解析失败: {exc}") from exc
         nodes = msg.get("nodes")
+        quaternions = msg.get("node_quaternions_wxyz")
         if not (isinstance(nodes, list) and len(nodes) == NODE_COUNT
                 and all(isinstance(n, list) and len(n) == 3 for n in nodes)):
             raise ManusError(f"nodes 须为 {NODE_COUNT}×3 数组")
+        if not (isinstance(quaternions, list) and len(quaternions) == NODE_COUNT
+                and all(isinstance(q, list) and len(q) == 4 for q in quaternions)):
+            raise ManusError(
+                f"node_quaternions_wxyz 须为 {NODE_COUNT}×4 数组"
+            )
+        values = [v for row in nodes for v in row] + [
+            v for row in quaternions for v in row
+        ]
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                   and math.isfinite(v) for n in nodes for v in n):
-            raise ManusError("nodes 含非数值或非有限值")
-        msg["nodes"] = [[float(v) for v in n] for n in nodes]
+                   and math.isfinite(v) for v in values):
+            raise ManusError("节点位姿含非数值或非有限值")
+        for field in ("seq", "source_monotonic_ns", "sdk_publish_time"):
+            value = msg.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ManusError(f"{field} 须为非负整数")
+        quat_array = [
+            [float(v) for v in quaternion] for quaternion in quaternions
+        ]
+        if any(sum(v * v for v in quaternion) <= 1e-12
+               for quaternion in quat_array):
+            raise ManusError("node_quaternions_wxyz 含零范数四元数")
+        msg["nodes"] = [[float(v) for v in node] for node in nodes]
+        msg["node_quaternions_wxyz"] = quat_array
         return msg
 
-    # 二进制:75 个 float32 little-endian
     data = bytes(payload)
-    if len(data) != NODE_COUNT * 3 * 4:
-        raise ManusError(f"二进制节点须为 {NODE_COUNT * 3 * 4} 字节,实际 {len(data)}")
-    vals = struct.unpack(f"<{NODE_COUNT * 3}f", data)
-    if not all(math.isfinite(v) for v in vals):
-        raise ManusError("二进制节点含非有限值")
-    nodes = [list(vals[i:i + 3]) for i in range(0, len(vals), 3)]
-    return {"glove_id": None, "side": None, "seq": -1, "nodes": nodes}
+    if len(data) != BINARY_SIZE:
+        raise ManusError(f"二进制位姿须为 {BINARY_SIZE} 字节，实际 {len(data)}")
+    unpacked = struct.unpack(BINARY_FORMAT, data)
+    if unpacked[0] != BINARY_MAGIC:
+        raise ManusError("二进制位姿 magic 不是 MNS1")
+    seq, source_monotonic_ns, sdk_publish_time = unpacked[1:4]
+    values = unpacked[4:]
+    nodes_flat = values[:NODE_COUNT * 3]
+    quats_flat = values[NODE_COUNT * 3:]
+    if not all(math.isfinite(v) for v in values):
+        raise ManusError("二进制节点位姿含非有限值")
+    nodes = [list(nodes_flat[i:i + 3]) for i in range(0, len(nodes_flat), 3)]
+    quaternions = [
+        list(quats_flat[i:i + 4]) for i in range(0, len(quats_flat), 4)
+    ]
+    if any(sum(v * v for v in quaternion) <= 1e-12 for quaternion in quaternions):
+        raise ManusError("二进制节点旋转含零范数四元数")
+    return {
+        "glove_id": None,
+        "side": None,
+        "seq": int(seq),
+        "source_monotonic_ns": int(source_monotonic_ns),
+        "sdk_publish_time": int(sdk_publish_time),
+        "nodes": nodes,
+        "node_quaternions_wxyz": quaternions,
+    }
 
 
 def parse_edges(payload: bytes | str) -> list[tuple[int, int, int]]:

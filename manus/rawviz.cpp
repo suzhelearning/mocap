@@ -1,16 +1,19 @@
 // rawviz.cpp — Manus Metaglove Pro raw 骨架 25 关键点采集器
-// 以 Integrated 模式连接 dongle，把每帧骨架节点位置输出到 stdout。
+// 以 Integrated 模式连接 dongle，把每帧骨架节点的局部位姿与源时间输出到 stdout。
 //
 // 输出协议（一行一条，供 viz.py/zenoh_pub.py 解析）：
 //   HAND <gloveId hex8> <Left|Right> <nodeCount>
 //   EDGE <gloveId hex8> <childNodeId> <parentNodeId> <chainType>
-//   POS  <gloveId hex8> <seq> <x0> <y0> <z0> <x1> <y1> <z1> ...
-//        (每手套独立流:seq 为该手套自增序号,左右手完全解耦,类似 ROS 双 topic)
+//   POSE <gloveId> <seq> <source_monotonic_ns> <sdk_publish_time>
+//        <x0> <y0> <z0> <qw0> <qx0> <qy0> <qz0> ...
+//        (每手套独立 seq；source_monotonic_ns 在 SDK 回调入口采集)
 //
-// 编译（pixi 工具链）：
-//   g++ -std=c++17 -I<SDK>/ManusSDK/include rawviz.cpp \
+// 编译（系统工具链）：
+//   /usr/bin/g++ -std=c++17 -O2 -pthread -I<SDK>/ManusSDK/include rawviz.cpp \
 //       -L<SDK>/ManusSDK/lib -l:libManusSDK_Integrated.so \
-//       /lib/x86_64-linux-gnu/libudev.so.1 /lib/x86_64-linux-gnu/libusb-1.0.so.0 \
+//       /usr/lib/x86_64-linux-gnu/libudev.so.1 \
+//       /usr/lib/x86_64-linux-gnu/libusb-1.0.so.0 \
+//       /usr/lib/x86_64-linux-gnu/libz.so.1 \
 //       -Wl,-rpath,<SDK>/ManusSDK/lib -o rawviz.out
 
 #include <cstdio>
@@ -63,10 +66,16 @@ static void BuildCalibrationPath(const char* t_Base, char* t_Out, size_t t_OutSi
 // 最新帧缓存（SDK 回调线程写入，主循环读取）——按手套独立缓存,
 // 每手套自己的 seq(左右手解耦:一只遮挡不影响另一只)
 // ---------------------------------------------------------------------------
-struct NodePose { float x, y, z; };
+struct NodePose
+{
+	float x, y, z;
+	float qw, qx, qy, qz;
+};
 struct GloveStream
 {
 	uint64_t seq = 0;
+	uint64_t sourceMonotonicNs = 0;
+	uint64_t sdkPublishTime = 0;
 	std::vector<NodePose> nodes;
 };
 
@@ -148,6 +157,9 @@ static void HandleSignal(int)
 static void OnRawSkeletonStream(const SkeletonStreamInfo* const p_Info)
 {
 	if (!p_Info) return;
+	const uint64_t t_SourceMonotonicNs = (uint64_t)std::chrono::duration_cast<
+		std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
 
 	std::lock_guard<std::mutex> t_Lock(g_FrameMutex);
 	for (uint32_t i = 0; i < p_Info->skeletonsCount; i++)
@@ -158,6 +170,8 @@ static void OnRawSkeletonStream(const SkeletonStreamInfo* const p_Info)
 
 		GloveStream& t_Stream = g_LatestFrames[t_SkelInfo.gloveId];
 		t_Stream.seq++;                       // 每手套独立自增
+		t_Stream.sourceMonotonicNs = t_SourceMonotonicNs;
+		t_Stream.sdkPublishTime = t_SkelInfo.publishTime.time;
 		t_Stream.nodes.clear();
 
 		if (t_SkelInfo.nodesCount > 0)
@@ -174,9 +188,12 @@ static void OnRawSkeletonStream(const SkeletonStreamInfo* const p_Info)
 				t_Stream.nodes.reserve(t_SkelInfo.nodesCount);
 				for (uint32_t n = 0; n < t_SkelInfo.nodesCount; n++)
 				{
-					t_Stream.nodes.push_back({ t_Nodes[n].transform.position.x,
-					                           t_Nodes[n].transform.position.y,
-					                           t_Nodes[n].transform.position.z });
+					const ManusTransform& t_Transform = t_Nodes[n].transform;
+					t_Stream.nodes.push_back({
+						t_Transform.position.x, t_Transform.position.y, t_Transform.position.z,
+						t_Transform.rotation.w, t_Transform.rotation.x,
+						t_Transform.rotation.y, t_Transform.rotation.z
+					});
 				}
 			}
 		}
@@ -399,9 +416,13 @@ int main(int argc, char* argv[])
 			t_LastSeq[t_GloveId] = t_Stream.seq;
 
 			EnsureTopology(t_GloveId);
-			printf("POS %08X %llu", t_GloveId, (unsigned long long)t_Stream.seq);
+			printf("POSE %08X %llu %llu %llu", t_GloveId,
+			       (unsigned long long)t_Stream.seq,
+			       (unsigned long long)t_Stream.sourceMonotonicNs,
+			       (unsigned long long)t_Stream.sdkPublishTime);
 			for (const NodePose& t_N : t_Stream.nodes)
-				printf(" %.6f %.6f %.6f", t_N.x, t_N.y, t_N.z);
+				printf(" %.6f %.6f %.6f %.7f %.7f %.7f %.7f",
+				       t_N.x, t_N.y, t_N.z, t_N.qw, t_N.qx, t_N.qy, t_N.qz);
 			printf("\n");
 		}
 		fflush(stdout);

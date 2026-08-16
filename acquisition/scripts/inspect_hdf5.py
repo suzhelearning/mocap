@@ -12,6 +12,9 @@ from pathlib import Path
 import h5py
 import numpy as np
 import yaml
+EV_START = 0
+EV_SAVE = 1
+
 
 
 @dataclass(frozen=True)
@@ -131,6 +134,37 @@ def _check_ragged(
             errors.append(
                 f"{label}/{field} flat 长度 {len(dataset)} != {flat_count}")
 
+def _check_quaternions(
+    dataset: h5py.Dataset,
+    valid: np.ndarray,
+    label: str,
+    errors: list[str],
+) -> None:
+    values = np.asarray(dataset[:], dtype=np.float64)[valid].reshape(-1, 4)
+    if len(values) == 0:
+        return
+    if not np.isfinite(values).all():
+        errors.append(f"{label} 有效帧含 NaN/Inf")
+        return
+    norm_error = float(np.max(np.abs(np.linalg.norm(values, axis=1) - 1.0)))
+    if norm_error > 1e-3:
+        errors.append(f"{label} 四元数范数最大误差 {norm_error:.2e}>1e-3")
+
+
+def _rotation_matrices_xyzw(quaternions: np.ndarray) -> np.ndarray:
+    q = np.asarray(quaternions, dtype=np.float64)
+    q = q / np.linalg.norm(q, axis=1, keepdims=True)
+    x, y, z, w = q.T
+    return np.stack((
+        1 - 2 * (y * y + z * z), 2 * (x * y - z * w),
+        2 * (x * z + y * w),
+        2 * (x * y + z * w), 1 - 2 * (x * x + z * z),
+        2 * (y * z - x * w),
+        2 * (x * z - y * w), 2 * (y * z + x * w),
+        1 - 2 * (x * x + y * y),
+    ), axis=1).reshape(-1, 3, 3)
+
+
 _OBSOLETE_MANO_FIELDS = (
     "mano_joints16",
     "mano_pose",
@@ -160,6 +194,558 @@ def _check_mano_beta(
         )
 
 
+def _check_compact_dataset(
+    dataset: h5py.Dataset,
+    label: str,
+    *,
+    count: int,
+    tail: tuple[int, ...],
+    dtype: np.dtype,
+    errors: list[str],
+) -> None:
+    expected_shape = (count, *tail)
+    if dataset.shape != expected_shape:
+        errors.append(f"{label} 形状 {dataset.shape} != {expected_shape}")
+    if dataset.dtype != dtype:
+        errors.append(f"{label} dtype {dataset.dtype} != {dtype}")
+
+
+def _check_exact_children(
+    group: h5py.Group | h5py.File,
+    label: str,
+    required: set[str],
+    errors: list[str],
+    *,
+    optional: set[str] = frozenset(),
+) -> None:
+    actual = set(group.keys())
+    missing = sorted(required - actual)
+    extra = sorted(actual - required - optional)
+    if missing:
+        errors.append(f"{label} 缺少字段 {missing}")
+    if extra:
+        errors.append(f"{label} 含契约外字段 {extra}")
+
+
+def _inspect_compact_v4(
+    f: h5py.File,
+    *,
+    strict: bool,
+    min_rate_ratio: float,
+    max_gap_ms: float,
+    errors: list[str],
+    warnings: list[str],
+) -> None:
+    """校验 compact-aligned-60hz-v1 的最小消费者契约。"""
+    if str(f.attrs.get("schema_layout", "")) != "compact-aligned-60hz-v1":
+        errors.append("v4 schema_layout 必须为 compact-aligned-60hz-v1")
+    if str(f.attrs.get("time_domain", "")) != "linux-clock-monotonic":
+        errors.append("v4 time_domain 必须为 linux-clock-monotonic")
+    if float(f.attrs.get("output_hz", 0.0)) != 60.0:
+        errors.append("v4 output_hz 必须为 60")
+    _check_exact_children(
+        f,
+        "/",
+        {"time_ns", "valid", "hands", "objects", "events"},
+        errors,
+    )
+    time_ds = _require(f, "time_ns", errors)
+    valid_ds = _require(f, "valid", errors)
+    if time_ds is None or valid_ds is None:
+        return
+    count = len(time_ds)
+    _check_compact_dataset(
+        time_ds, "time_ns", count=count, tail=(), dtype=np.dtype("int64"),
+        errors=errors,
+    )
+    _check_compact_dataset(
+        valid_ds, "valid", count=count, tail=(), dtype=np.dtype("uint8"),
+        errors=errors,
+    )
+    target_hz = 60.0
+    timing = _check_timing(
+        "time_ns",
+        time_ds,
+        errors=errors,
+        warnings=warnings,
+        max_gap_ms=max_gap_ms,
+        min_rate_hz=target_hz * min_rate_ratio if strict else None,
+    )
+    if timing.count >= 2:
+        dt = np.diff(np.asarray(time_ds[:], dtype=np.int64))
+        ideal = 1e9 / target_hz
+        if np.max(np.abs(dt - ideal)) > 1.0:
+            errors.append("time_ns 不是严格固定 60 Hz 栅格")
+
+    valid_values = np.asarray(valid_ds[:], dtype=np.uint8)
+    if not np.isin(valid_values, (0, 1)).all():
+        errors.append("valid 只能包含 0/1")
+    frame_valid = valid_values.astype(bool)
+    if strict and count and np.mean(frame_valid) < min_rate_ratio:
+        errors.append(
+            f"valid 有效率 {np.mean(frame_valid):.1%}<{min_rate_ratio:.0%}",
+        )
+
+    hands = _require(f, "hands", errors)
+    if hands is not None:
+        _check_exact_children(hands, "hands", {"left", "right"}, errors)
+        for side in ("left", "right"):
+            group = _require(hands, side, errors)
+            if group is None:
+                continue
+            label = f"hands/{side}"
+            required = {
+                "keypoints_world",
+                "wrist_position",
+                "wrist_quaternion_xyzw",
+                "valid",
+            }
+            _check_exact_children(
+                group, label, required, errors, optional={"mano_beta"},
+            )
+            fields = (
+                ("keypoints_world", (21, 3), np.dtype("float32")),
+                ("wrist_position", (3,), np.dtype("float32")),
+                ("wrist_quaternion_xyzw", (4,), np.dtype("float32")),
+                ("valid", (), np.dtype("uint8")),
+            )
+            for name, tail, dtype in fields:
+                dataset = _require(group, name, errors)
+                if dataset is not None:
+                    _check_compact_dataset(
+                        dataset,
+                        f"{label}/{name}",
+                        count=count,
+                        tail=tail,
+                        dtype=dtype,
+                        errors=errors,
+                    )
+            if (
+                not required.issubset(group.keys())
+                or any(
+                    group[name].shape != (count, *tail)
+                    for name, tail, _ in fields
+                )
+            ):
+                continue
+            hand_valid_values = np.asarray(group["valid"][:], dtype=np.uint8)
+            if not np.isin(hand_valid_values, (0, 1)).all():
+                errors.append(f"{label}/valid 只能包含 0/1")
+            hand_valid = hand_valid_values.astype(bool)
+            keypoints = np.asarray(group["keypoints_world"][:])
+            wrist = np.asarray(group["wrist_position"][:])
+            if np.any(hand_valid):
+                if not np.isfinite(keypoints[hand_valid]).all():
+                    errors.append(f"{label}/keypoints_world 有效帧含 NaN/Inf")
+                root_error = float(np.max(
+                    np.abs(keypoints[hand_valid, 0] - wrist[hand_valid]),
+                ))
+                if root_error > 1e-5:
+                    errors.append(
+                        f"{label} root/wrist 误差 {root_error:.2e}m",
+                    )
+            _check_quaternions(
+                group["wrist_quaternion_xyzw"],
+                hand_valid,
+                f"{label}/wrist_quaternion_xyzw",
+                errors,
+            )
+            _check_mano_beta(group, label, errors)
+            if strict and count and np.mean(hand_valid) < min_rate_ratio:
+                errors.append(
+                    f"{label} 有效率 "
+                    f"{np.mean(hand_valid):.1%}<{min_rate_ratio:.0%}",
+                )
+
+    objects = _require(f, "objects", errors)
+    if objects is not None:
+        for name, group in objects.items():
+            label = f"objects/{name}"
+            required = {
+                "object_position", "object_quaternion_xyzw", "valid",
+            }
+            _check_exact_children(group, label, required, errors)
+            fields = (
+                ("object_position", (3,), np.dtype("float32")),
+                ("object_quaternion_xyzw", (4,), np.dtype("float32")),
+                ("valid", (), np.dtype("uint8")),
+            )
+            for field, tail, dtype in fields:
+                dataset = _require(group, field, errors)
+                if dataset is not None:
+                    _check_compact_dataset(
+                        dataset,
+                        f"{label}/{field}",
+                        count=count,
+                        tail=tail,
+                        dtype=dtype,
+                        errors=errors,
+                    )
+            if (
+                not required.issubset(group.keys())
+                or any(
+                    group[field].shape != (count, *tail)
+                    for field, tail, _ in fields
+                )
+            ):
+                continue
+            object_valid_values = np.asarray(group["valid"][:], dtype=np.uint8)
+            if not np.isin(object_valid_values, (0, 1)).all():
+                errors.append(f"{label}/valid 只能包含 0/1")
+            object_valid = object_valid_values.astype(bool)
+            if np.any(object_valid) and not np.isfinite(
+                np.asarray(group["object_position"][:])[object_valid],
+            ).all():
+                errors.append(f"{label}/object_position 有效帧含 NaN/Inf")
+            _check_quaternions(
+                group["object_quaternion_xyzw"],
+                object_valid,
+                f"{label}/object_quaternion_xyzw",
+                errors,
+            )
+            if strict and count and np.mean(object_valid) < min_rate_ratio:
+                errors.append(
+                    f"{label} 有效率 "
+                    f"{np.mean(object_valid):.1%}<{min_rate_ratio:.0%}",
+                )
+
+    events = _require(f, "events", errors)
+    if events is not None:
+        _check_exact_children(
+            events, "events", {"frame_index", "type"}, errors,
+        )
+        frame_index = _require(events, "frame_index", errors)
+        event_type = _require(events, "type", errors)
+        if frame_index is not None and event_type is not None:
+            event_count = len(frame_index)
+            _check_compact_dataset(
+                frame_index,
+                "events/frame_index",
+                count=event_count,
+                tail=(),
+                dtype=np.dtype("int64"),
+                errors=errors,
+            )
+            _check_compact_dataset(
+                event_type,
+                "events/type",
+                count=event_count,
+                tail=(),
+                dtype=np.dtype("uint8"),
+                errors=errors,
+            )
+            indices = np.asarray(frame_index[:], dtype=np.int64)
+            types = np.asarray(event_type[:], dtype=np.uint8)
+            if np.any(np.diff(indices) < 0):
+                errors.append("events/frame_index 非单调")
+            if np.any(indices < 0) or np.any(indices > count):
+                errors.append(f"events/frame_index 必须在 [0,{count}]")
+            if not np.isin(types, (EV_START, EV_SAVE)).all():
+                errors.append("events/type 只能包含 start(0)/save(1)")
+            if EV_START not in types:
+                errors.append("events 缺少 start")
+            if EV_SAVE not in types:
+                errors.append("events 缺少 save")
+
+
+def _inspect_aligned_v3(
+    f: h5py.File,
+    *,
+    strict: bool,
+    min_rate_ratio: float,
+    max_gap_ms: float,
+    errors: list[str],
+    warnings: list[str],
+) -> None:
+    """校验 aligned-60hz-v1：所有派生数组必须与唯一 timeline 等长。"""
+    for attr in (
+        "schema_layout", "time_domain", "output_hz", "effective_config_yaml",
+        "base_config_yaml", "rigid_body_names_json",
+    ):
+        if attr not in f.attrs:
+            errors.append(f"v3 缺少根属性 {attr}")
+    if str(f.attrs.get("schema_layout", "")) != "aligned-60hz-v1":
+        errors.append("v3 schema_layout 必须为 aligned-60hz-v1")
+    if str(f.attrs.get("time_domain", "")) != "linux-clock-monotonic":
+        errors.append("v3 time_domain 必须为 linux-clock-monotonic")
+    if float(f.attrs.get("output_hz", 0.0)) != 60.0:
+        errors.append("v3 output_hz 必须固定为 60")
+    timeline = _require(f, "timeline", errors)
+    if timeline is None:
+        return
+    t_ds = _require(timeline, "t_phys_ns", errors)
+    if t_ds is None:
+        return
+    target_hz = float(f.attrs.get("output_hz", 60.0))
+    timing = _check_timing(
+        "timeline", t_ds, errors=errors, warnings=warnings,
+        max_gap_ms=max_gap_ms,
+        min_rate_hz=target_hz * min_rate_ratio if strict else None,
+    )
+    n = timing.count
+    required_timeline = (
+        "frame_index", "t_emit_ns", "emission_latency_ns",
+        "frame_valid", "reason_flags",
+    )
+    for name in required_timeline:
+        dataset = _require(timeline, name, errors)
+        if dataset is not None and len(dataset) != n:
+            errors.append(f"timeline/{name} 长度 {len(dataset)} != {n}")
+    if "frame_valid" in timeline and n:
+        frame_valid_ratio = float(np.mean(timeline["frame_valid"][:]))
+        print(f"  frame valid={frame_valid_ratio:.1%}")
+        if strict and frame_valid_ratio < min_rate_ratio:
+            errors.append(
+                f"timeline/frame_valid 有效率 "
+                f"{frame_valid_ratio:.1%}<{min_rate_ratio:.0%}"
+            )
+    if "frame_index" in timeline:
+        indices = np.asarray(timeline["frame_index"][:], dtype=np.int64)
+        if n and not np.array_equal(indices, np.arange(n)):
+            errors.append("timeline/frame_index 必须从 0 连续递增")
+    if n >= 2:
+        dt = np.diff(np.asarray(t_ds[:], dtype=np.int64))
+        ideal = 1e9 / target_hz
+        if np.max(np.abs(dt - ideal)) > 1.0:
+            errors.append("timeline/t_phys_ns 不是严格固定 60 Hz 栅格")
+    if "t_emit_ns" in timeline:
+        latency = (
+            np.asarray(timeline["t_emit_ns"][:], dtype=np.int64)
+            - np.asarray(t_ds[:], dtype=np.int64)
+        )
+        if np.any(latency < 0):
+            errors.append("timeline 存在早于目标物理时刻的 emission")
+        if len(latency):
+            print(
+                "  emission latency: "
+                f"p50={np.percentile(latency, 50) / 1e6:.1f}ms, "
+                f"p95={np.percentile(latency, 95) / 1e6:.1f}ms"
+            )
+
+    def check_group_lengths(
+        group: h5py.Group,
+        label: str,
+        static_fields: frozenset[str] = frozenset(),
+    ) -> None:
+        for name, value in group.items():
+            if (
+                isinstance(value, h5py.Dataset)
+                and name not in static_fields
+                and len(value) != n
+            ):
+                errors.append(f"{label}/{name} 长度 {len(value)} != {n}")
+
+    quality = _require(f, "quality/mocap", errors)
+    if quality is not None:
+        check_group_lengths(quality, "quality/mocap")
+    for side in ("left", "right"):
+        group = _require(f, f"hands/{side}", errors)
+        if group is None:
+            continue
+        check_group_lengths(
+            group, f"hands/{side}", frozenset({"mano_beta"}),
+        )
+        for field, shape in (
+            ("nodes_local", (25, 3)),
+            ("node_quaternions_wxyz", (25, 4)),
+            ("nodes_world", (25, 3)),
+            ("mano_skeleton", (21, 3)),
+            ("wrist_position", (3,)),
+            ("wrist_quaternion_xyzw", (4,)),
+        ):
+            dataset = _require(group, field, errors)
+            if dataset is not None and dataset.shape[1:] != shape:
+                errors.append(
+                    f"hands/{side}/{field} 尾形状 {dataset.shape[1:]} != {shape}"
+                )
+        if "valid" in group and "mano_skeleton" in group:
+            valid = np.asarray(group["valid"][:], dtype=bool)
+            nodes = np.asarray(group["mano_skeleton"][:])
+            if "wrist_quaternion_xyzw" in group:
+                _check_quaternions(
+                    group["wrist_quaternion_xyzw"], valid,
+                    f"hands/{side}/wrist_quaternion_xyzw", errors,
+                )
+            if "node_quaternions_wxyz" in group:
+                _check_quaternions(
+                    group["node_quaternions_wxyz"], valid,
+                    f"hands/{side}/node_quaternions_wxyz", errors,
+                )
+            if np.any(valid) and not np.isfinite(nodes[valid]).all():
+                errors.append(f"hands/{side} 有效帧含 NaN/Inf")
+            if np.any(valid) and "wrist_position" in group:
+                wrist = np.asarray(group["wrist_position"][:])
+                root_error = float(np.max(np.abs(nodes[valid, 0] - wrist[valid])))
+                print(f"  hands/{side} root/wrist 最大误差: {root_error:.2e}m")
+                if root_error > 1e-5:
+                    errors.append(
+                        f"hands/{side} root/wrist 误差 {root_error:.2e}m"
+                    )
+            if n:
+                valid_ratio = float(np.mean(valid))
+                print(f"  hands/{side} valid={valid_ratio:.1%}")
+                if strict and valid_ratio < min_rate_ratio:
+                    errors.append(
+                        f"hands/{side} 有效率 "
+                        f"{valid_ratio:.1%}<{min_rate_ratio:.0%}"
+                    )
+        if strict and not group.attrs.get("edges_json"):
+            errors.append(f"hands/{side} 缺少 edges_json 拓扑")
+        _check_mano_beta(group, f"hands/{side}", errors)
+
+    objects = _require(f, "objects", errors)
+    interaction = _require(f, "interaction", errors)
+    if objects is not None:
+        for name, group in objects.items():
+            check_group_lengths(group, f"objects/{name}")
+            for field, shape in (
+                ("rigid_position", (3,)),
+                ("rigid_quaternion_xyzw", (4,)),
+                ("object_position", (3,)),
+                ("object_quaternion_xyzw", (4,)),
+            ):
+                dataset = _require(group, field, errors)
+                if dataset is not None and dataset.shape[1:] != shape:
+                    errors.append(
+                        f"objects/{name}/{field} 尾形状 "
+                        f"{dataset.shape[1:]} != {shape}"
+                    )
+            object_valid = (
+                np.asarray(group["valid"][:], dtype=bool)
+                if "valid" in group else np.zeros(n, dtype=bool)
+            )
+            if len(object_valid):
+                valid_ratio = float(np.mean(object_valid))
+                print(f"  object/{name} valid={valid_ratio:.1%}")
+                if strict and valid_ratio < min_rate_ratio:
+                    errors.append(
+                        f"object/{name} 有效率 "
+                        f"{valid_ratio:.1%}<{min_rate_ratio:.0%}"
+                    )
+            for field in (
+                "rigid_quaternion_xyzw", "object_quaternion_xyzw",
+            ):
+                if field in group:
+                    _check_quaternions(
+                        group[field], object_valid,
+                        f"objects/{name}/{field}", errors,
+                    )
+            if np.any(object_valid):
+                for field in ("rigid_position", "object_position"):
+                    if field in group and not np.isfinite(
+                        np.asarray(group[field][:])[object_valid]
+                    ).all():
+                        errors.append(
+                            f"objects/{name}/{field} 有效帧含 NaN/Inf"
+                        )
+            if interaction is None or name not in interaction:
+                errors.append(f"缺少 interaction/{name}")
+                continue
+            interaction_group = interaction[name]
+            check_group_lengths(interaction_group, f"interaction/{name}")
+            for side in ("left", "right"):
+                hand_group = f[f"hands/{side}"]
+                hand_valid = np.asarray(
+                    hand_group["valid"][:], dtype=bool,
+                )
+                expected_valid = object_valid & hand_valid
+                valid_dataset = _require(
+                    interaction_group, f"{side}_valid", errors,
+                )
+                points_dataset = _require(
+                    interaction_group, f"{side}_nodes_object", errors,
+                )
+                if points_dataset is not None and points_dataset.shape[1:] != (21, 3):
+                    errors.append(
+                        f"interaction/{name}/{side}_nodes_object 尾形状 "
+                        f"{points_dataset.shape[1:]} != (21, 3)"
+                    )
+                if valid_dataset is not None and not np.array_equal(
+                    np.asarray(valid_dataset[:], dtype=bool), expected_valid,
+                ):
+                    errors.append(
+                        f"interaction/{name}/{side}_valid "
+                        "不等于 hand_valid & object_valid"
+                    )
+                if points_dataset is None or not np.any(expected_valid):
+                    continue
+                rotations = _rotation_matrices_xyzw(
+                    np.asarray(
+                        group["object_quaternion_xyzw"][:],
+                        dtype=np.float64,
+                    )[expected_valid],
+                )
+                delta = (
+                    np.asarray(
+                        hand_group["mano_skeleton"][:],
+                        dtype=np.float64,
+                    )[expected_valid]
+                    - np.asarray(
+                        group["object_position"][:],
+                        dtype=np.float64,
+                    )[expected_valid, None, :]
+                )
+                expected = np.einsum(
+                    "nji,nkj->nki", rotations, delta,
+                )
+                actual = np.asarray(
+                    points_dataset[:], dtype=np.float64,
+                )[expected_valid]
+                error = float(np.max(np.abs(actual - expected)))
+                if error > 1e-5:
+                    errors.append(
+                        f"interaction/{name}/{side}_nodes_object "
+                        f"坐标误差 {error:.2e}m"
+                    )
+
+    raw = _require(f, "raw", errors)
+    quality_root = _require(f, "quality", errors)
+    if quality_root is not None:
+        if "stream_gap_counts_json" not in quality_root.attrs:
+            errors.append("quality 缺少 stream_gap_counts_json")
+        clock_root = quality_root.get("clock_alignment")
+        if strict and not isinstance(clock_root, h5py.Group):
+            errors.append("quality 缺少 clock_alignment")
+        if isinstance(clock_root, h5py.Group):
+            for stream in ("mocap", "left", "right"):
+                clock = clock_root.get(stream)
+                if strict and not isinstance(clock, h5py.Group):
+                    errors.append(f"clock_alignment 缺少 {stream}")
+                    continue
+                if not isinstance(clock, h5py.Group):
+                    continue
+                for field in (
+                    "valid", "sample_count", "offset_ms", "drift_ppm",
+                    "jitter_p95_ms", "resets",
+                ):
+                    if field not in clock:
+                        errors.append(
+                            f"clock_alignment/{stream} 缺少 {field}"
+                        )
+                if strict and "valid" in clock and not bool(clock["valid"][()]):
+                    errors.append(f"clock_alignment/{stream} 尚未收敛")
+
+    if raw is not None:
+        for label in ("mocap", "hands/left", "hands/right"):
+            group = _require(raw, label, errors)
+            if group is not None and "t_phys_ns" in group:
+                raw_timing = _timing(group["t_phys_ns"])
+                print(
+                    f"  raw/{label}: {raw_timing.count} 样本, "
+                    f"{raw_timing.rate_hz:.1f}Hz"
+                )
+                if not raw_timing.monotonic:
+                    errors.append(f"raw/{label} 时间戳非严格单调")
+
+    events = _require(f, "events", errors)
+    if events is not None and "type" in events:
+        event_types = set(int(value) for value in events["type"][:])
+        if 0 not in event_types:
+            errors.append("events 缺少 start")
+        if strict and 3 not in event_types:
+            errors.append("events 缺少 save")
+
+
 def inspect_file(
     path: str | Path,
     *,
@@ -182,17 +768,64 @@ def inspect_file(
         except ValueError as exc:
             return [str(exc)]
 
-        for attr in ("h5_version", "take_id", "start_wall_ns", "end_wall_ns",
-                     "config_yaml"):
+        version = str(f.attrs.get("h5_version", "?"))
+        required_attrs = (
+            "h5_version",
+            "take_id",
+            "start_wall_ns",
+            "end_wall_ns",
+            "effective_config_yaml",
+        ) if version == "4.0" else (
+            "h5_version",
+            "take_id",
+            "start_wall_ns",
+            "end_wall_ns",
+            "config_yaml",
+        )
+        for attr in required_attrs:
             if attr not in f.attrs:
                 errors.append(f"缺少根属性 {attr}")
-        version = str(f.attrs.get("h5_version", "?"))
         print(f"  schema: {version}, take_id={f.attrs.get('take_id')}")
-        if version not in {"1.0", "2.0"}:
+        if version not in {"1.0", "2.0", "3.0", "4.0"}:
             errors.append(f"不支持的 h5_version={version}")
+        if version == "4.0":
+            _inspect_compact_v4(
+                f,
+                strict=strict,
+                min_rate_ratio=min_rate_ratio,
+                max_gap_ms=max_gap_ms,
+                errors=errors,
+                warnings=warnings,
+            )
+            for warning in warnings:
+                print(f"[WARN] {warning}")
+            for error in errors:
+                print(f"[FAIL] {error}", file=sys.stderr)
+            return errors
+        if version == "3.0":
+            _inspect_aligned_v3(
+                f,
+                strict=strict,
+                min_rate_ratio=min_rate_ratio,
+                max_gap_ms=max_gap_ms,
+                errors=errors,
+                warnings=warnings,
+            )
+            if "stream_health_json" in f.attrs:
+                try:
+                    json.loads(str(f.attrs["stream_health_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    errors.append("stream_health_json 不是合法 JSON")
+            for warning in warnings:
+                print(f"[WARN] {warning}")
+            for error in errors:
+                print(f"[FAIL] {error}", file=sys.stderr)
+            return errors
         if version == "2.0":
-            for attr in ("effective_config_yaml", "base_config_yaml",
-                         "rigid_body_names_json"):
+            for attr in (
+                "effective_config_yaml", "base_config_yaml",
+                "rigid_body_names_json",
+            ):
                 if attr not in f.attrs:
                     errors.append(f"v2 缺少根属性 {attr}")
 

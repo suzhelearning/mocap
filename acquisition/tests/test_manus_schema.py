@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from acquisition.manus_schema import (
+    BINARY_FORMAT,
     MEDIAPIPE_FROM_MANUS,
     ManusError,
     decode_manus,
@@ -21,7 +22,15 @@ from acquisition.manus_schema import (
 def _raw_msg(nodes=None):
     if nodes is None:
         nodes = [[float(i), 0.0, 0.0] for i in range(25)]
-    return {"glove_id": "aabbccdd", "side": "left", "seq": 42, "nodes": nodes}
+    return {
+        "glove_id": "aabbccdd",
+        "side": "left",
+        "seq": 42,
+        "source_monotonic_ns": 123456,
+        "sdk_publish_time": 789,
+        "nodes": nodes,
+        "node_quaternions_wxyz": [[1.0, 0.0, 0.0, 0.0] for _ in range(25)],
+    }
 
 
 def test_decode_manus_json():
@@ -31,19 +40,22 @@ def test_decode_manus_json():
     assert msg["seq"] == 42
     assert len(msg["nodes"]) == 25
     assert all(len(n) == 3 for n in msg["nodes"])
-
+    assert len(msg["node_quaternions_wxyz"]) == 25
 
 def test_decode_manus_binary():
-    vals = [float(i) for i in range(75)]
-    payload = struct.pack(f"<{75}f", *vals)
+    nodes = [float(i) for i in range(75)]
+    rotations = [1.0, 0.0, 0.0, 0.0] * 25
+    payload = struct.pack(BINARY_FORMAT, b"MNS1", 42, 123456, 789,
+                          *(nodes + rotations))
     msg = decode_manus(payload)
     assert msg["nodes"][1][0] == 3.0
-    assert len(msg["nodes"]) == 25
-    assert msg["seq"] == -1              # 二进制模式无 seq 来源,给默认值
+    assert len(msg["node_quaternions_wxyz"]) == 25
+    assert msg["seq"] == 42
+    assert msg["source_monotonic_ns"] == 123456
 
 
 def test_decode_manus_binary_wrong_length():
-    with pytest.raises(ManusError, match="二进制节点须为"):
+    with pytest.raises(ManusError, match="二进制位姿须为"):
         decode_manus(struct.pack("<3f", 1.0, 2.0, 3.0))
 
 
@@ -56,10 +68,12 @@ def test_decode_manus_rejects_non_finite_json():
 
 
 def test_decode_manus_rejects_non_finite_binary():
-    vals = [float(i) for i in range(75)]
-    vals[0] = float("inf")
+    nodes = [float(i) for i in range(75)]
+    nodes[0] = float("inf")
+    rotations = [1.0, 0.0, 0.0, 0.0] * 25
     with pytest.raises(ManusError, match="非有限"):
-        decode_manus(struct.pack(f"<{75}f", *vals))
+        decode_manus(struct.pack(BINARY_FORMAT, b"MNS1", 1, 2, 3,
+                                 *(nodes + rotations)))
 
 
 def test_decode_manus_bad_nodes():

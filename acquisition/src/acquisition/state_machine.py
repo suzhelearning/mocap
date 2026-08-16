@@ -24,7 +24,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .config import Config
-from .recorder import EV_DISCARD, EV_SAVE, EV_START, TakeWriter
+from .recorder import EV_SAVE, EV_START, TakeWriter
 
 WriterFactory = Callable[[int, Path], TakeWriter]
 
@@ -92,25 +92,24 @@ class TakeController:
                 / f"{stamp}_take{self.take_id:03d}.h5")
         self.writer = self._writer_factory(self.take_id, path)
         self.writer.begin(self.take_id, self._start_ns)
-        self.writer.append_event(EV_START, "start")
+        self.writer.append_event(EV_START)
         self.state = State.RECORDING
         self.last_result = ""
 
     def _on_save(self) -> None:
         if self.state is State.RECORDING:
-            self.writer.append_event(EV_SAVE, "save")
+            self.writer.append_event(EV_SAVE)
             self.writer.finalize_save()
             n = self.writer.counts()
             self.last_result = (
                 f"[saved] {self.writer.path.name} "
-                f"({n['mocap']} mocap, {n['left']}/{n['right']} hand)"
+                f"({n['aligned']} aligned)"
             )
             self.writer = None
             self.state = State.IDLE
 
     def _on_discard(self) -> None:
         if self.state is State.RECORDING:
-            self.writer.append_event(EV_DISCARD, "discard")
             self.writer.discard()
             self.last_result = f"[discarded] take#{self.take_id}"
             self.writer = None

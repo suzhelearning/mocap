@@ -36,7 +36,7 @@ def _make_h5(path: Path, side: str, n: int = 10) -> np.ndarray:
         group = f.create_group("hands").create_group(side)
         group.create_dataset("t_ubuntu_ns", data=np.arange(n, dtype=np.int64))
         group.create_dataset("wrist_position", data=skeleton[:, 0].astype(np.float32))
-        group.create_dataset("mano_skeleton", data=skeleton.astype(np.float32))
+        group.create_dataset("keypoints_world", data=skeleton.astype(np.float32))
     return beta
 
 
@@ -47,7 +47,7 @@ def test_estimate_and_write_beta_only(tmp_path):
 
     assert error is None
     assert estimate is not None
-    assert estimate.skeleton_source == "mano_skeleton"
+    assert estimate.skeleton_source == "keypoints_world"
     assert estimate.samples_used == 6
     assert np.abs(estimate.beta - beta_true).max() < 0.3
 

@@ -1,7 +1,7 @@
-"""StreamHub:单 Zenoh session 多流订阅(mocap 帧 + manus 双手骨架/拓扑)。
+"""Zenoh 多流订阅；保留源时间并映射到本机 CLOCK_MONOTONIC 时间域。
 
-回调在 zenoh 库线程上执行,只做「校验 → 打 t_ubuntu_ns → 广播给订阅者」,
-绝不阻塞。订阅者回调须自行入队/拷贝(录制器、可视化各自处理)。
+Zenoh 回调只做解码、时钟映射、缓存和入队。``t_phys_ns`` 是中央对齐器
+唯一使用的时间字段；``t_ubuntu_ns`` 仅保留为到达 wall-clock 诊断字段。
 """
 
 from __future__ import annotations
@@ -10,21 +10,17 @@ import json
 import queue
 import threading
 import time
-from collections import deque
 from collections.abc import Callable
 
-import numpy as np
 import zenoh
 
 RATE_WINDOW = 2.0            # 帧率统计滑动窗口(秒),窗口满结算重置
 
-MOCAP_HISTORY_SEC = 1.0      # mocap 帧历史保留时长(插值对齐用,120Hz 下 ~120 帧)
 DISPATCH_QUEUE_CAPACITY = 2048
 
 from natnet_zenoh.schema import FRAME_KEY, decode_frame
 from .clock_sync import ClockAligner
 
-from .kinematics import quat_slerp
 
 RIGID_BODY_NAMES_KEY = "mocap/rigid_body_names"   # Windows publisher 发布的刚体名→ID
 
@@ -40,8 +36,10 @@ from .manus_schema import (
 FrameCallback = Callable[[dict], None]   # 已打 t_ubuntu_ns 的帧
 
 
-def _stamp(frame: dict, t_ns: int) -> dict:
-    frame["t_ubuntu_ns"] = t_ns
+def _stamp(frame: dict, *, wall_ns: int, monotonic_ns: int, phys_ns: int) -> dict:
+    frame["t_ubuntu_ns"] = wall_ns
+    frame["arrival_monotonic_ns"] = monotonic_ns
+    frame["t_phys_ns"] = phys_ns
     return frame
 
 
@@ -61,8 +59,11 @@ class StreamHub:
         self._lock = threading.RLock()
 
         self._latest_mocap: dict | None = None
-        self._mocap_history: deque[tuple[int, dict]] = deque()
         self._mocap_clock = ClockAligner()
+        self._manus_clocks = {
+            "left": ClockAligner(),
+            "right": ClockAligner(),
+        }
         self._rigid_body_names: dict[int, str] = {}
         self._rigid_body_ids: dict[str, int] = {}
         self._latest_manus: dict[str, dict | None] = {"left": None, "right": None}
@@ -115,66 +116,6 @@ class StreamHub:
         with self._lock:
             return self._latest_mocap
 
-    def mocap_at(self, t_ns: int) -> dict | None:
-        """按目标时刻对 mocap 刚体流插值(位置 lerp + 四元数 slerp)。
-
-        用于与手套帧对齐:手套帧 t_ubuntu_ns 时刻的刚体位姿 = 包围该时刻的
-        两帧 mocap 插值,消除双流帧周期错位(0~8.3ms)。
-
-        刚体按 id 配对:两帧都有 → 插值;仅一帧有 → 取该帧;
-        tracking_valid 取较近一帧。t 超出历史范围 → 取最近端帧。
-        无历史返回 None。
-        """
-        with self._lock:
-            hist = list(self._mocap_history)
-            latest = self._latest_mocap
-        if not hist:
-            return latest
-        t0, f0 = hist[0]
-        t1, f1 = hist[-1]
-        if t_ns <= t0:
-            return f0
-        if t_ns >= t1:
-            return f1
-        # 找包围 t_ns 的两帧(二分)
-        lo, hi = 0, len(hist) - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if hist[mid][0] <= t_ns:
-                lo = mid
-            else:
-                hi = mid
-        ta, fa = hist[lo]
-        tb, fb = hist[hi]
-        frac = (t_ns - ta) / (tb - ta) if tb > ta else 0.0
-
-        rbs_a = {rb["id"]: rb for rb in fa.get("rigid_bodies", [])}
-        rbs_b = {rb["id"]: rb for rb in fb.get("rigid_bodies", [])}
-        out: list[dict] = []
-        for rid in sorted(set(rbs_a) | set(rbs_b)):
-            a, b = rbs_a.get(rid), rbs_b.get(rid)
-            if a is None:
-                out.append(dict(b))
-            elif b is None:
-                out.append(dict(a))
-            else:
-                pa = np.asarray(a["position"], dtype=float)
-                pb = np.asarray(b["position"], dtype=float)
-                qa = np.asarray(a["quaternion_xyzw"], dtype=float)[[3, 0, 1, 2]]
-                qb = np.asarray(b["quaternion_xyzw"], dtype=float)[[3, 0, 1, 2]]
-                qm = quat_slerp(qa, qb, frac)[[1, 2, 3, 0]]     # wxyz→xyzw
-                out.append({
-                    "id": rid,
-                    "position": ((1 - frac) * pa + frac * pb).tolist(),
-                    "quaternion_xyzw": qm.tolist(),
-                    "mean_error": (a["mean_error"] + b["mean_error"]) / 2.0,
-                    "tracking_valid": (b["tracking_valid"] if frac >= 0.5
-                                       else a["tracking_valid"]),
-                })
-        frame = dict(fb)
-        frame["rigid_bodies"] = out
-        frame["t_aligned_ubuntu_ns"] = t_ns
-        return frame
 
     def latest_manus(self, side: str) -> dict | None:
         with self._lock:
@@ -197,7 +138,11 @@ class StreamHub:
         return {
             "streams": streams,
             "dispatch_queue_depth": self._dispatch_q.qsize(),
-            "clock_alignment": self._mocap_clock.quality(),
+            "clock_alignment": {
+                "mocap": self._mocap_clock.quality(),
+                "left": self._manus_clocks["left"].quality(),
+                "right": self._manus_clocks["right"].quality(),
+            },
         }
 
     def rates_hz(self) -> dict[str, float]:
@@ -385,19 +330,22 @@ class StreamHub:
             with self._lock:
                 self._health["mocap"]["decode_errors"] += 1
             return
-        arrival_ns = time.time_ns()
+        arrival_wall_ns = time.time_ns()
+        arrival_monotonic_ns = time.monotonic_ns()
         aligned_ns = self._mocap_clock.observe(
-            int(frame.get("publisher_received_time_ns", 0)), arrival_ns)
-        stamped = _stamp(frame, arrival_ns)
-        stamped["t_aligned_ubuntu_ns"] = aligned_ns
-        cutoff = aligned_ns - int(MOCAP_HISTORY_SEC * 1e9)
+            int(frame.get("publisher_received_time_ns", 0)),
+            arrival_monotonic_ns,
+        )
+        stamped = _stamp(
+            frame,
+            wall_ns=arrival_wall_ns,
+            monotonic_ns=arrival_monotonic_ns,
+            phys_ns=aligned_ns,
+        )
         with self._lock:
             self._latest_mocap = stamped
-            self._mocap_history.append((aligned_ns, stamped))
-            while self._mocap_history and self._mocap_history[0][0] < cutoff:
-                self._mocap_history.popleft()
             self._observe_sequence(
-                "mocap", frame.get("frame_number"), arrival_ns)
+                "mocap", frame.get("frame_number"), arrival_monotonic_ns)
             self._rate_counts["mocap"] += 1
             callbacks = list(self._mocap_cbs)
         self._enqueue("mocap", callbacks, stamped)
@@ -412,12 +360,22 @@ class StreamHub:
             with self._lock:
                 self._health[side]["decode_errors"] += 1
             return
-        t_ns = time.time_ns()
+        arrival_wall_ns = time.time_ns()
+        arrival_monotonic_ns = time.monotonic_ns()
+        source_ns = int(msg.get("source_monotonic_ns", 0))
+        aligned_ns = self._manus_clocks[side].observe(
+            source_ns, arrival_monotonic_ns,
+        )
         msg["side"] = side
-        stamped = _stamp(msg, t_ns)
+        stamped = _stamp(
+            msg,
+            wall_ns=arrival_wall_ns,
+            monotonic_ns=arrival_monotonic_ns,
+            phys_ns=aligned_ns,
+        )
         with self._lock:
             self._latest_manus[side] = stamped
-            self._observe_sequence(side, msg.get("seq"), t_ns)
+            self._observe_sequence(side, msg.get("seq"), arrival_monotonic_ns)
             self._rate_counts[side] += 1
             callbacks = list(self._manus_cbs[side])
         self._enqueue(side, callbacks, stamped)

@@ -55,22 +55,25 @@ class ManusRawPublisher(Node):
         tag = parts[0]
         if tag == "HAND" and len(parts) >= 4:
             gid, side, n = parts[1], parts[2], int(parts[3])
-            self.hands[gid] = {"side": side, "node_count": n,
-                               "edges": [], "pos": np.zeros((n, 3)), "valid": False}
+            self.hands[gid] = {
+                "side": side, "node_count": n, "edges": [],
+                "poses": np.zeros((n, 7)), "valid": False,
+            }
         elif tag == "EDGE" and len(parts) == 5:
             h = self.hands.get(parts[1])
             if h:
                 h["edges"].append((int(parts[2]) - 1, int(parts[3]) - 1))
-        elif tag == "POS" and len(parts) >= 4:
+        elif tag == "POSE" and len(parts) >= 5:
             h = self.hands.get(parts[1])
             if h:
-                vals = np.asarray(parts[2:2 + h["node_count"] * 3], dtype=float)
-                if vals.size == h["node_count"] * 3:
-                    h["pos"] = vals.reshape(h["node_count"], 3)
+                vals = np.asarray(
+                    parts[5:5 + h["node_count"] * 7], dtype=float,
+                )
+                if vals.size == h["node_count"] * 7:
+                    h["poses"] = vals.reshape(h["node_count"], 7)
                     h["valid"] = True
-        elif tag == "FRAME":
-            self.frame_no += 1
-            self.publish()
+                    self.frame_no += 1
+                    self.publish()
 
     # -- 发布 ---------------------------------------------------------------
     def publish(self):
@@ -83,11 +86,15 @@ class ManusRawPublisher(Node):
             msg = PoseArray()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = f"manus_{h['side'].lower()}"
-            for p in h["pos"]:
+            for row in h["poses"]:
                 pose = Pose()
-                pose.position.x = float(p[0])
-                pose.position.y = float(p[1])
-                pose.position.z = float(p[2])
+                pose.position.x = float(row[0])
+                pose.position.y = float(row[1])
+                pose.position.z = float(row[2])
+                pose.orientation.w = float(row[3])
+                pose.orientation.x = float(row[4])
+                pose.orientation.y = float(row[5])
+                pose.orientation.z = float(row[6])
                 msg.poses.append(pose)
             self.pos_pubs[h["side"]].publish(msg)
 

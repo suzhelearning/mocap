@@ -27,7 +27,6 @@ axis_transform:
   signs: [1, 1, -1]
 recording:
   output_dir: "captures"
-  store_markers: true
 keys:
   start: r
   save: s
@@ -125,6 +124,22 @@ hands:
     assert cfg.axis_permutation == (0, 2, 1)
     assert cfg.keymap == {"start": "r", "save": "s",
                           "discard": "d", "quit": "q"}
+    assert cfg.alignment_hz == 60.0
+    assert cfg.alignment_latency_ms == 50.0
+    assert cfg.mocap_max_gap_ms == 25.0
+    assert cfg.manus_max_gap_ms == 35.0
+
+
+def test_alignment_output_rate_is_not_configurable():
+    bad = SAMPLE + "\nalignment: {output_hz: 100}\n"
+    with pytest.raises(ConfigError, match="固定为 60"):
+        _load(bad)
+
+
+def test_alignment_thresholds_must_be_positive():
+    bad = SAMPLE + "\nalignment: {latency_ms: 0}\n"
+    with pytest.raises(ConfigError, match="latency_ms"):
+        _load(bad)
 
 
 def test_no_back_with_all_wrist_rigid_ids():
@@ -221,7 +236,8 @@ hands:
   left:  { back_rigid_id: 2, wrist_offset: { mode: body, xyz: [0, 0, 0] } }
   right: { back_rigid_id: 1, wrist_offset: { mode: body, xyz: [0, 0, 0] } }
 axis_transform: { permutation: [0, 2, 1], signs: [1, 1, -1] }
-recording: { output_dir: "captures", store_markers: false, sample_hz: 100 }
+alignment: { output_hz: 60, latency_ms: 50 }
+recording: { output_dir: "captures" }
 """)
     (tmp_path / "offset").mkdir()
     (tmp_path / "offset" / "syz.yaml").write_text("""
@@ -261,7 +277,8 @@ hands:
   left:  { back_rigid_id: 2 }
   right: { back_rigid_id: 1 }
 axis_transform: { permutation: [0, 2, 1], signs: [1, 1, -1] }
-recording: { output_dir: "captures", store_markers: false, sample_hz: 100 }
+alignment: { output_hz: 60, latency_ms: 50 }
+recording: { output_dir: "captures" }
 """)
     (tmp_path / "offset").mkdir()
     (tmp_path / "offset" / "syz.yaml").write_text("left:\n  xyz: [9, 9, 9]\n")

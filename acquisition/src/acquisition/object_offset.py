@@ -39,6 +39,43 @@ class ObjectOffset:
     quaternion_xyzw: np.ndarray
 
 
+def offset_from_motive_visuals(
+    geometry_location_xyz_mm: Sequence[float],
+    geometry_orientation_pyr_deg: Sequence[float],
+) -> ObjectOffset:
+    """把 Motive Visuals 的 GL XYZ 与 GO Pitch/Yaw/Roll 转为物体外参。
+
+    Motive 使用右手系和 XYZ 旋转顺序：Pitch 绕 X、Yaw 绕 Y、Roll 绕 Z。
+    Geometry Location 的界面单位为毫米，配置与采集位姿统一使用米。
+    """
+    translation_mm = _readonly_f64(
+        geometry_location_xyz_mm,
+        (3,),
+        "Geometry Location XYZ",
+    )
+    pyr_deg = _readonly_f64(
+        geometry_orientation_pyr_deg,
+        (3,),
+        "Geometry Orientation Pitch/Yaw/Roll",
+    )
+    translation_m = _readonly_f64(
+        translation_mm / 1000.0,
+        (3,),
+        "T_motive_rigid_from_obj translation_m",
+    )
+    rotation_matrix = _readonly_f64(
+        Rotation.from_euler("xyz", pyr_deg, degrees=True).as_matrix(),
+        (3, 3),
+        "T_motive_rigid_from_obj rotation_matrix",
+    )
+    quaternion_xyzw = _readonly_f64(
+        Rotation.from_matrix(rotation_matrix).as_quat(),
+        (4,),
+        "T_motive_rigid_from_obj quaternion_xyzw",
+    )
+    return ObjectOffset(translation_m, rotation_matrix, quaternion_xyzw)
+
+
 @dataclass(frozen=True)
 class PreprocessResult:
     """一次非破坏预处理的结果摘要。"""
@@ -121,6 +158,29 @@ def load_object_offsets(
         )
         result[name] = ObjectOffset(translation, matrix, quaternion)
     return result
+
+
+def require_object_offsets(
+    object_names: Sequence[str],
+    configured_offsets: dict[str, ObjectOffset],
+) -> dict[str, ObjectOffset]:
+    """返回当前采集物体的外参；任一缺失都拒绝启动采集。"""
+    names = tuple(dict.fromkeys(object_names))
+    missing = sorted(set(names) - set(configured_offsets))
+    if missing:
+        commands = "\n".join(
+            "  pixi run add-object-offset -- "
+            f"{name} --gl-mm X Y Z --go-deg PITCH YAW ROLL"
+            for name in missing
+        )
+        raise ObjectOffsetError(
+            f"当前物体缺少 OBJ offset: {missing}。\n"
+            "请先在 Motive 的 Rigid Body > Visuals 中把几何体对齐，"
+            "记录 Geometry Location (GL) XYZ [mm] 和 Geometry Orientation "
+            "(GO) Pitch/Yaw/Roll [deg]，然后在 acquisition 目录运行:\n"
+            f"{commands}"
+        )
+    return {name: configured_offsets[name] for name in names}
 
 
 def object_offsets_sha256(path: str | Path = DEFAULT_OBJECT_OFFSETS_PATH) -> str:
@@ -264,6 +324,11 @@ def preprocess_hdf5(
     config_hash = object_offsets_sha256(config_path)
     with h5py.File(source_path, "r") as source_h5:
         _reject_external_links(source_h5)
+        if str(source_h5.attrs.get("h5_version", "")) in {"3.0", "4.0"}:
+            raise ObjectOffsetError(
+                "v3/v4 已包含同 tick 的 object 坐标；"
+                "请在实时采集配置中应用外参，拒绝离线改写"
+            )
         objects = source_h5.get("objects")
         if not isinstance(objects, h5py.Group) or len(objects) == 0:
             raise ObjectOffsetError("HDF5 缺少非空 objects 组")
