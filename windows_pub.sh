@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # -- Windows 侧参数(与 net.md / pub_test.bat 一致) --------------------------
 # 路径用 %USERPROFILE% 动态拼接(cmd 环境变量,即 ~\Desktop\syz\NatNetSDK)
 WIN_SSH_ARGS=(-i "$HOME/.ssh/id_ed25519_windows" -o BatchMode=yes -o ConnectTimeout=6 \
-              -l "current robotics" 192.168.110.6)
+              -l "current robotics" 169.254.213.247)
 WIN_PUB_CMD='cd /d "%USERPROFILE%\Desktop\syz\NatNetSDK" && .pixi\envs\windows\python.exe -u -m natnet_zenoh.publisher --motive-server-ip 127.0.0.1 --natnet-client-ip 127.0.0.1 --zenoh-endpoint tcp/169.254.1.0:7447'
 
 # -- PowerShell 辅助:heredoc 构造代码 → UTF-16LE base64 → ssh 执行 -------------

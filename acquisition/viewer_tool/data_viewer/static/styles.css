@@ -264,6 +264,7 @@ h3 {
   border-bottom: 1px solid var(--line);
 }
 
+#folder-filter,
 #object-filter,
 .search-field {
   display: flex;
@@ -275,6 +276,7 @@ h3 {
   background: var(--surface);
 }
 
+#folder-filter,
 #object-filter {
   padding: 0 10px;
   cursor: pointer;
@@ -324,6 +326,7 @@ h3 {
   color: var(--muted);
 }
 
+#folder-filter:focus,
 #object-filter:focus,
 .search-field:focus-within {
   border-color: var(--blue-ink);

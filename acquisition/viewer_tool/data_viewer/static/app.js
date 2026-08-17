@@ -10,6 +10,7 @@ const els = {
   title: document.querySelector("#app-title"),
   status: document.querySelector("#status"),
   search: document.querySelector("#search-input"),
+  folderFilter: document.querySelector("#folder-filter"),
   objectFilter: document.querySelector("#object-filter"),
   count: document.querySelector("#sample-count"),
   list: document.querySelector("#sample-list"),
@@ -23,10 +24,12 @@ const els = {
 };
 
 els.search.addEventListener("input", renderSampleList);
-els.objectFilter.addEventListener("change", () => {
-  renderSampleList();
-  selectFirstVisibleSample();
-});
+for (const filter of [els.folderFilter, els.objectFilter]) {
+  filter.addEventListener("change", () => {
+    renderSampleList();
+    selectFirstVisibleSample();
+  });
+}
 for (const button of els.modeButtons) {
   button.addEventListener("click", () => setPlaybackMode(button.dataset.playbackMode));
 }
@@ -50,6 +53,7 @@ async function loadProject() {
     state.samples = payload.index.samples || [];
     els.title.textContent = payload.index.title || "Motion Archive";
     setStatus(`${payload.index.sample_count} sessions · ${basename(payload.index.root)}`);
+    populateFolderFilter();
     populateObjectFilter();
     renderSampleList();
     if (state.samples.length) selectSample(state.samples[0].id);
@@ -60,8 +64,10 @@ async function loadProject() {
 
 function renderSampleList() {
   const query = els.search.value.trim().toLowerCase();
+  const selectedFolder = els.folderFilter.value;
   const selectedObject = els.objectFilter.value;
   const samples = state.samples.filter((sample) => {
+    if (selectedFolder && sampleFolder(sample) !== selectedFolder) return false;
     if (selectedObject && sample.facets?.object !== selectedObject) return false;
     if (!query) return true;
     const haystack = [
@@ -91,6 +97,23 @@ function renderSampleList() {
   }
 }
 
+function populateFolderFilter() {
+  const folders = [...new Set(state.samples.map((sample) => sampleFolder(sample)).filter(Boolean))].sort();
+  const previous = els.folderFilter.value;
+  els.folderFilter.innerHTML = `<option value="">All folders</option>`;
+  for (const folder of folders) {
+    const option = document.createElement("option");
+    option.value = folder;
+    option.textContent = folder;
+    els.folderFilter.append(option);
+  }
+  if (previous && folders.includes(previous)) els.folderFilter.value = previous;
+}
+
+function sampleFolder(sample) {
+  return sample.facets?.dataset || sample.group_label || "";
+}
+
 function populateObjectFilter() {
   const objects = [...new Set(state.samples.map((sample) => sample.facets?.object).filter(Boolean))].sort();
   els.objectFilter.innerHTML = `<option value="">All objects</option>`;
@@ -103,8 +126,12 @@ function populateObjectFilter() {
 }
 
 function selectFirstVisibleSample() {
+  const selectedFolder = els.folderFilter.value;
   const selectedObject = els.objectFilter.value;
-  const first = state.samples.find((sample) => !selectedObject || sample.facets?.object === selectedObject);
+  const first = state.samples.find((sample) =>
+    (!selectedFolder || sampleFolder(sample) === selectedFolder) &&
+    (!selectedObject || sample.facets?.object === selectedObject)
+  );
   if (first) selectSample(first.id);
 }
 
