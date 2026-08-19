@@ -16,6 +16,7 @@ rigid_bodies:
   objects:                         # 物体 ID→名；每个名称必须存在于 config/object_offsets.yaml
     cylinder: 3
     cube: 8
+    hammer: 9
 
 hands:
   left:

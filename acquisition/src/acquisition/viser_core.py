@@ -59,7 +59,13 @@ MANO_FINGER_EDGES = (
 )
 
 # 刚体 ID → 标签(与 config.yaml 对应;未配置的 ID 显示原始编号)
-RIGID_LABELS = {1: "左腕(back)", 2: "右腕(back)", 3: "cylinder"}
+RIGID_LABELS = {
+    1: "左腕(back)",
+    2: "右腕(back)",
+    3: "cylinder",
+    8: "cube",
+    9: "hammer",
+}
 
 HAND_EDGES = [(c, p) for c, p in MANO_PALM_EDGES] + list(MANO_FINGER_EDGES)
 

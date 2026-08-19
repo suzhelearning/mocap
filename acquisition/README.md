@@ -72,7 +72,8 @@ bash ../manus_pub.sh --user syz             # 用 calibration/syzLeft/RightMetag
 bash ../windows_pub.sh
 
 # 路线 3/3:数据 web 订阅与收集(本程序,web :8081 + 录制按钮)
-bash ../record.sh
+bash ../record.sh --object cylinder     # 只采集一种物体
+bash ../record.sh --object hammer cube  # 采集多种物体(--object 必须显式指定)
 ```
 
 三条路线独立启动/停止、任意顺序(router 常驻即可)。无数据流入时采集程序

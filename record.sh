@@ -5,7 +5,8 @@
 #   键盘 r/s/d/q 同样可用。退出(q / Ctrl-C)时录制中先丢弃未保存 take。
 #
 # 用法:
-#   bash record.sh            # 真实配置(config.yaml)
+#   bash record.sh --object cylinder         # 只采集一种物体
+#   bash record.sh --object hammer cube      # 一次采集多种(必须显式指定)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,4 +20,4 @@ fi
 echo "[record] 浏览器打开 http://127.0.0.1:8081 (q 或 Ctrl-C 退出)"
 echo "[record] 录制控制见 web 左侧面板;键盘 r/s/d 同样可用"
 cd "$ACQ_DIR"
-exec pixi run record
+exec pixi run record -- "$@"

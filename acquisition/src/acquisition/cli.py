@@ -17,6 +17,7 @@ import shutil
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -78,6 +79,10 @@ def main(argv: list[str] | None = None) -> int:
                          "客户端都能查看数据并操控录制)")
     ap.add_argument("--no-markers", action="store_true",
                     help="可视化不渲染原始 markers")
+    ap.add_argument("--object", action="extend", nargs="+", metavar="NAME",
+                    required=True,
+                    help="采集物体(必须显式指定,如 --object hammer cube;"
+                         "可多个 --object 重复,如 --object hammer --object cube)")
     args = ap.parse_args(argv)
 
     try:
@@ -85,6 +90,19 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"[错误] 配置加载失败: {exc}", file=sys.stderr)
         return 2
+
+    # --object:过滤为物体子集(录制 HDF5/可视化/外参校验全部跟随)
+    if args.object:
+        wanted = dict.fromkeys(args.object)   # 保序去重
+        unknown = [n for n in wanted if n not in cfg.objects]
+        if unknown:
+            print(f"[错误] 未知物体: {', '.join(unknown)}。"
+                  f"可选: {', '.join(cfg.objects) or '(配置中无物体)'}",
+                  file=sys.stderr)
+            return 2
+        cfg = replace(cfg, objects={n: cfg.objects[n] for n in wanted})
+        print(f"[采集] 本次只采集物体: {', '.join(cfg.objects)}",
+              file=sys.stderr)
 
     # 清理上次异常退出(崩溃/强杀)残留的临时文件与私有目录
     _cleanup_orphan_tmp(cfg.output_dir)
