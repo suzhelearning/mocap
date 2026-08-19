@@ -8,7 +8,10 @@ version = "1.0.0"
 view = "mocap-viewer"
 view-open = "mocap-viewer --open"
 subscribe = "python scripts/zenoh_consumer.py"
+track-rigid = "python scripts/track_rigid.py"
+calibrate-tcp = "python scripts/calibrate_tcp.py"
 test = "pytest src/mocap_viewer/tests -q"
+test-track-rigid = "python -m unittest tests.test_track_rigid"
 
 [dependencies]
 python = "3.12.*"
