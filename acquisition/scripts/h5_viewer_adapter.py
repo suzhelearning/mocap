@@ -25,6 +25,10 @@ for _path in (_SRC, _SCRIPTS):
         sys.path.insert(0, str(_path))
 
 from acquisition.viser_core import (  # noqa: E402
+    TABLE_CENTER,
+    TABLE_COLOR,
+    TABLE_DEPTH,
+    TABLE_WIDTH,
     apply_frame,
     build_scene_nodes,
     extract_hdf5,
@@ -44,9 +48,24 @@ from data_viewer.contracts import (  # noqa: E402
 from viser import ViserServer  # noqa: E402
 
 # 资源/场景契约变化时提升版本；OBJ 修改时间另参与缓存新鲜度判断。
+# 桌面几何常量见 acquisition.viser_core(TABLE_WIDTH/DEPTH/CENTER/COLOR)。
 RECORD_STEP = 2
-RECORDING_VERSION = 7
-MANO_RECORDING_VERSION = 10
+RECORDING_VERSION = 21
+MANO_RECORDING_VERSION = 24
+
+
+def _table_frame_segments() -> np.ndarray:
+    """桌面矩形四条边(y=0 平面,分界线),形状 (4,2,3)。"""
+    cx, cz = TABLE_CENTER
+    x0, x1 = cx - TABLE_WIDTH / 2.0, cx + TABLE_WIDTH / 2.0
+    z0, z1 = cz - TABLE_DEPTH / 2.0, cz + TABLE_DEPTH / 2.0
+    corners = [(x0, z0), (x1, z0), (x1, z1), (x0, z1)]
+    segments = []
+    for i in range(4):
+        ax, az = corners[i]
+        bx, bz = corners[(i + 1) % 4]
+        segments.append(((ax, 0.0, az), (bx, 0.0, bz)))
+    return np.asarray(segments, dtype=np.float32)
 
 
 class H5ViewerAdapter(ViewerAdapter):
@@ -227,6 +246,85 @@ def _record_h5(path: Path, *, mano: bool = False) -> bytes:
         server.initial_camera.fov = 50.0
         server.scene.add_frame(
             "/world", position=(0.0, 1.0, 0.0), show_axes=False,
+        )
+
+        # 桌面分界线(矩形四边,y=0 平面)
+        server.scene.add_line_segments(
+            "/world/table/frame",
+            points=_table_frame_segments(),
+            colors=TABLE_COLOR,
+            line_width=3.0,
+        )
+        # Motive 世界零点指示:±X 红色参考线(各 800mm)、+Z 蓝色参考线(1000mm),
+        # 线长=桌子边界:±X 到桌边(半宽)、+Z 到桌边(桌深),不超出桌面
+        ORIGIN_X_LEN = TABLE_WIDTH / 2.0     # 0.72 → 720mm
+        ORIGIN_Z_LEN = TABLE_DEPTH           # 0.90 → 900mm
+        ORIGIN_RED = (220, 40, 40)
+        ORIGIN_BLUE = (40, 90, 220)
+        for sign in (1.0, -1.0):
+            server.scene.add_line_segments(
+                f"/world/origin/ref_x_{'p' if sign > 0 else 'm'}",
+                points=np.asarray([
+                    ((0.0, 0.0, 0.0), (sign * ORIGIN_X_LEN, 0.0, 0.0)),
+                ], dtype=np.float32),
+                colors=np.tile(ORIGIN_RED, (1, 2, 1)).astype(np.uint8),
+                line_width=3.0,
+            )
+        server.scene.add_line_segments(
+            "/world/origin/ref_z",
+            points=np.asarray([
+                ((0.0, 0.0, 0.0), (0.0, 0.0, ORIGIN_Z_LEN)),
+            ], dtype=np.float32),
+            colors=np.tile(ORIGIN_BLUE, (1, 2, 1)).astype(np.uint8),
+            line_width=3.0,
+        )
+
+        # 平铺在 XZ 平面上的黑色线段字形(字高 5cm、字宽 5cm),避免 viser Label 始终 billboard。
+        # 仅保留 +X 800mm 处的 X、+Z 1000mm 处的 Z。
+        AXIS_LABEL_HEIGHT = 0.05
+        AXIS_LABEL_WIDTH = 0.05
+        AXIS_LABEL_Y = 0.005         # 略高于桌面 5mm,避免 z-fighting
+        label_half_h = AXIS_LABEL_HEIGHT / 2.0
+        label_half_w = AXIS_LABEL_WIDTH / 2.0
+
+        x_label_x, x_label_z = 0.8, 0.0
+        x_label_segments = np.asarray([
+            (
+                (x_label_x - label_half_w, AXIS_LABEL_Y, x_label_z - label_half_h),
+                (x_label_x + label_half_w, AXIS_LABEL_Y, x_label_z + label_half_h),
+            ),
+            (
+                (x_label_x - label_half_w, AXIS_LABEL_Y, x_label_z + label_half_h),
+                (x_label_x + label_half_w, AXIS_LABEL_Y, x_label_z - label_half_h),
+            ),
+        ], dtype=np.float32)
+        server.scene.add_line_segments(
+            "/world/origin/x_label_pos800",
+            points=x_label_segments,
+            colors=np.tile(ORIGIN_RED, (2, 2, 1)).astype(np.uint8),
+            line_width=4.0,
+        )
+
+        z_label_x, z_label_z = 0.0, 1.0
+        z_label_segments = np.asarray([
+            (
+                (z_label_x - label_half_w, AXIS_LABEL_Y, z_label_z + label_half_h),
+                (z_label_x + label_half_w, AXIS_LABEL_Y, z_label_z + label_half_h),
+            ),
+            (
+                (z_label_x - label_half_w, AXIS_LABEL_Y, z_label_z + label_half_h),
+                (z_label_x + label_half_w, AXIS_LABEL_Y, z_label_z - label_half_h),
+            ),
+            (
+                (z_label_x - label_half_w, AXIS_LABEL_Y, z_label_z - label_half_h),
+                (z_label_x + label_half_w, AXIS_LABEL_Y, z_label_z - label_half_h),
+            ),
+        ], dtype=np.float32)
+        server.scene.add_line_segments(
+            "/world/origin/z_label_pos1000",
+            points=z_label_segments,
+            colors=np.tile(ORIGIN_BLUE, (3, 2, 1)).astype(np.uint8),
+            line_width=4.0,
         )
 
         serializer = server.get_scene_serializer()

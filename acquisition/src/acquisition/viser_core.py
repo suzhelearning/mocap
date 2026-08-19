@@ -331,6 +331,13 @@ def extract_hdf5(f: h5py.File) -> dict:
     }
 
 
+# 桌面道具(Motive 世界系,米制):Motive 原点位于桌子近边,中心沿 +z 偏移半个深度
+TABLE_WIDTH = 1.440
+TABLE_DEPTH = 0.900
+TABLE_CENTER = (0.0, TABLE_DEPTH / 2.0)   # (x, z):原点在 z=0 桌边,中心 z=+0.45
+TABLE_COLOR = (16, 185, 129)              # emerald,与实时可视化桌面同色
+
+
 @dataclass
 class SceneNodes:
     """场景节点句柄集合;build_scene_nodes 创建,apply_frame 逐帧更新。"""
@@ -355,9 +362,10 @@ def build_scene_nodes(scene: viser.ViserScene, data: dict) -> SceneNodes:
         plane_color=(235, 240, 250), plane_opacity=0.15,
     )
     nodes.handles.append(grid)
-    # 桌面:半透明平面(TableSpec 默认值,相对 /world 的 y=0 平面,实际 y=1)
-    x0, x1 = -0.72, 0.72
-    z0, z1 = -0.45, 0.45
+    # 桌面:半透明平面(与 TABLE_* 常量一致,Motive 世界系 y=0 平面)
+    cx, cz = TABLE_CENTER
+    x0, x1 = cx - TABLE_WIDTH / 2.0, cx + TABLE_WIDTH / 2.0
+    z0, z1 = cz - TABLE_DEPTH / 2.0, cz + TABLE_DEPTH / 2.0
     verts = np.asarray([
         [x0, 0, z0], [x1, 0, z0], [x1, 0, z1], [x0, 0, z1],
     ], dtype=np.float32)
