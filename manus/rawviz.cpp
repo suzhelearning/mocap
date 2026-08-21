@@ -27,6 +27,8 @@
 #include <thread>
 #include <chrono>
 #include <map>
+#include <deque>
+#include <condition_variable>
 #include <unistd.h>
 #include <limits.h>
 
@@ -36,6 +38,9 @@
 static const uint32_t kMaxNodesPerGlove = 64;
 // 校准文件大小上限(正常 ~几 KB;防被替换为超大文件触发大分配)
 static const long kMaxCalibrationBytes = 4 * 1024 * 1024;
+// 每手套帧队列容量:100Hz 下约 160ms 缓冲,吸收下游瞬时阻塞而不丢帧;
+// 持续过载时丢最旧帧保实时性,内存与延迟有界
+static const size_t kMaxQueuedFrames = 16;
 
 // 校准用户:--user <名字> 指定后使用 calibration/<名字>Left/RightMetaglovePro.mcal;
 // 为空则使用无前缀的 Left/RightMetaglovePro.mcal(旧行为,文件缺失仅警告)
@@ -63,8 +68,10 @@ static void BuildCalibrationPath(const char* t_Base, char* t_Out, size_t t_OutSi
 }
 
 // ---------------------------------------------------------------------------
-// 最新帧缓存（SDK 回调线程写入，主循环读取）——按手套独立缓存,
-// 每手套自己的 seq(左右手解耦:一只遮挡不影响另一只)
+// 帧队列缓存（SDK 回调线程入队，主循环出队）——按手套独立队列,
+// 每手套自己的 seq(左右手解耦:一只遮挡不影响另一只)。
+// 队列有界(kMaxQueuedFrames):吸收下游瞬时阻塞而不丢帧;
+// 持续过载时丢最旧帧保实时性,内存与延迟有界。
 // ---------------------------------------------------------------------------
 struct NodePose
 {
@@ -78,9 +85,15 @@ struct GloveStream
 	uint64_t sdkPublishTime = 0;
 	std::vector<NodePose> nodes;
 };
+struct GloveQueue
+{
+	std::deque<GloveStream> frames;   // 待输出帧(先进先出)
+	uint64_t lastSeq = 0;             // 已入队最大 seq(队列清空后继续自增)
+};
 
 static std::mutex g_FrameMutex;
-static std::map<uint32_t, GloveStream> g_LatestFrames;   // gloveId -> 最新帧
+static std::condition_variable g_FrameCV;
+static std::map<uint32_t, GloveQueue> g_FrameQueues;   // gloveId -> 帧队列
 static std::atomic<bool> g_Running{ true };
 
 // 拓扑信息缓存：gloveId -> (nodeId, parentId) 列表（与节点数组同序）
@@ -161,43 +174,69 @@ static void OnRawSkeletonStream(const SkeletonStreamInfo* const p_Info)
 		std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now().time_since_epoch()).count();
 
-	std::lock_guard<std::mutex> t_Lock(g_FrameMutex);
-	for (uint32_t i = 0; i < p_Info->skeletonsCount; i++)
+	uint32_t t_Dropped = 0;               // 本次回调因队列满丢弃的帧数
 	{
-		RawSkeletonInfo t_SkelInfo{};
-		if (CoreSdk_GetRawSkeletonInfo(i, &t_SkelInfo) != SDKReturnCode_Success)
-			continue;
-
-		GloveStream& t_Stream = g_LatestFrames[t_SkelInfo.gloveId];
-		t_Stream.seq++;                       // 每手套独立自增
-		t_Stream.sourceMonotonicNs = t_SourceMonotonicNs;
-		t_Stream.sdkPublishTime = t_SkelInfo.publishTime.time;
-		t_Stream.nodes.clear();
-
-		if (t_SkelInfo.nodesCount > 0)
+		std::lock_guard<std::mutex> t_Lock(g_FrameMutex);
+		for (uint32_t i = 0; i < p_Info->skeletonsCount; i++)
 		{
-			if (t_SkelInfo.nodesCount > kMaxNodesPerGlove)
-			{
-				fprintf(stderr, "[rawviz] 跳过异常节点数 %u (glove %08X)\n",
-				        (unsigned)t_SkelInfo.nodesCount, (unsigned)t_SkelInfo.gloveId);
+			RawSkeletonInfo t_SkelInfo{};
+			if (CoreSdk_GetRawSkeletonInfo(i, &t_SkelInfo) != SDKReturnCode_Success)
 				continue;
-			}
-			std::vector<SkeletonNode> t_Nodes(t_SkelInfo.nodesCount);
-			if (CoreSdk_GetRawSkeletonData(i, t_Nodes.data(), t_SkelInfo.nodesCount) == SDKReturnCode_Success)
+
+			GloveStream t_Stream;
+			t_Stream.seq = ++g_FrameQueues[t_SkelInfo.gloveId].lastSeq;
+			t_Stream.sourceMonotonicNs = t_SourceMonotonicNs;
+			t_Stream.sdkPublishTime = t_SkelInfo.publishTime.time;
+
+			if (t_SkelInfo.nodesCount > 0)
 			{
-				t_Stream.nodes.reserve(t_SkelInfo.nodesCount);
-				for (uint32_t n = 0; n < t_SkelInfo.nodesCount; n++)
+				if (t_SkelInfo.nodesCount > kMaxNodesPerGlove)
 				{
-					const ManusTransform& t_Transform = t_Nodes[n].transform;
-					t_Stream.nodes.push_back({
-						t_Transform.position.x, t_Transform.position.y, t_Transform.position.z,
-						t_Transform.rotation.w, t_Transform.rotation.x,
-						t_Transform.rotation.y, t_Transform.rotation.z
-					});
+					fprintf(stderr, "[rawviz] 跳过异常节点数 %u (glove %08X)\n",
+					        (unsigned)t_SkelInfo.nodesCount, (unsigned)t_SkelInfo.gloveId);
+					continue;
+				}
+				std::vector<SkeletonNode> t_Nodes(t_SkelInfo.nodesCount);
+				if (CoreSdk_GetRawSkeletonData(i, t_Nodes.data(), t_SkelInfo.nodesCount) == SDKReturnCode_Success)
+				{
+					t_Stream.nodes.reserve(t_SkelInfo.nodesCount);
+					for (uint32_t n = 0; n < t_SkelInfo.nodesCount; n++)
+					{
+						const ManusTransform& t_Transform = t_Nodes[n].transform;
+						t_Stream.nodes.push_back({
+							t_Transform.position.x, t_Transform.position.y, t_Transform.position.z,
+							t_Transform.rotation.w, t_Transform.rotation.x,
+							t_Transform.rotation.y, t_Transform.rotation.z
+						});
+					}
 				}
 			}
+
+			GloveQueue& t_Queue = g_FrameQueues[t_SkelInfo.gloveId];
+			if (t_Queue.frames.size() >= kMaxQueuedFrames)
+			{
+				t_Queue.frames.pop_front();   // 丢最旧:保最新帧,过载时输出 seq 跳号
+				t_Dropped++;
+			}
+			t_Queue.frames.push_back(std::move(t_Stream));
 		}
 	}
+
+	if (t_Dropped > 0)
+	{
+		// 限频警告:每 1s 最多一条,避免刷屏
+		static uint64_t t_LastWarnNs = 0;
+		const uint64_t t_NowNs = (uint64_t)std::chrono::duration_cast<
+			std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+		if (t_NowNs - t_LastWarnNs >= 1000000000ull)
+		{
+			fprintf(stderr, "[rawviz] 队列满,丢最旧 %u 帧(消费跟不上,seq 将跳号)\n",
+			        t_Dropped);
+			t_LastWarnNs = t_NowNs;
+		}
+	}
+	g_FrameCV.notify_all();               // 唤醒主循环(锁外,避免唤醒即抢锁)
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +396,7 @@ static bool CheckCalibrationFilesExist()
 }
 
 // ---------------------------------------------------------------------------
-// 主循环：约 120fps 读最新帧并输出（SDK 回调可达 120Hz,输出不得再压到 30fps）
+// 主循环：等待新帧并输出（SDK 回调可达 120Hz,输出不得再压到 30fps）
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[])
 {
@@ -394,36 +433,43 @@ int main(int argc, char* argv[])
 	}
 	fprintf(stderr, "[rawviz] connected, streaming raw skeleton...\n");
 
-	std::map<uint32_t, uint64_t> t_LastSeq;     // 每手套已输出序号
 	while (g_Running)
 	{
-		// 2ms 轮询:SDK 回调 ~102Hz,8ms 轮询 + printf/fflush 开销会丢帧(实测 57%)
-		std::this_thread::sleep_for(std::chrono::milliseconds(2));
-
-		std::map<uint32_t, GloveStream> t_Latest;
+		// 条件变量等待新帧:帧到达即唤醒,无需轮询,检出延迟 ~μs 级。
+		// 2ms 超时兜底:信号处理器不能安全 notify,靠超时醒来检查 g_Running。
+		// 队列容量内零丢帧;过载时回调侧丢最旧,输出侧始终跟得上。
+		std::vector<std::pair<uint32_t, std::deque<GloveStream>>> t_Batch;
 		{
-			std::lock_guard<std::mutex> t_Lock(g_FrameMutex);
-			t_Latest = g_LatestFrames;
+			std::unique_lock<std::mutex> t_Lock(g_FrameMutex);
+			g_FrameCV.wait_for(t_Lock, std::chrono::milliseconds(2), [] {
+				if (!g_Running) return true;
+				for (const auto& t_Entry : g_FrameQueues)
+					if (!t_Entry.second.frames.empty()) return true;
+				return false;
+			});
+			// 锁内批量搬移,printf 全部放锁外(printf 可能因管道背压阻塞)
+			for (auto& t_Entry : g_FrameQueues)
+				if (!t_Entry.second.frames.empty())
+					t_Batch.emplace_back(t_Entry.first,
+					                     std::move(t_Entry.second.frames));
 		}
 
-		// 每手套独立检查新帧并输出(左右手解耦)
-		for (const auto& t_Entry : t_Latest)
+		for (const auto& t_B : t_Batch)
 		{
-			const uint32_t t_GloveId = t_Entry.first;
-			const GloveStream& t_Stream = t_Entry.second;
-			if (t_Stream.seq == t_LastSeq[t_GloveId] || t_Stream.nodes.empty())
-				continue;
-			t_LastSeq[t_GloveId] = t_Stream.seq;
-
+			const uint32_t t_GloveId = t_B.first;
+			const std::deque<GloveStream>& t_Frames = t_B.second;
 			EnsureTopology(t_GloveId);
-			printf("POSE %08X %llu %llu %llu", t_GloveId,
-			       (unsigned long long)t_Stream.seq,
-			       (unsigned long long)t_Stream.sourceMonotonicNs,
-			       (unsigned long long)t_Stream.sdkPublishTime);
-			for (const NodePose& t_N : t_Stream.nodes)
-				printf(" %.6f %.6f %.6f %.7f %.7f %.7f %.7f",
-				       t_N.x, t_N.y, t_N.z, t_N.qw, t_N.qx, t_N.qy, t_N.qz);
-			printf("\n");
+			for (const GloveStream& t_Stream : t_Frames)
+			{
+				printf("POSE %08X %llu %llu %llu", t_GloveId,
+				       (unsigned long long)t_Stream.seq,
+				       (unsigned long long)t_Stream.sourceMonotonicNs,
+				       (unsigned long long)t_Stream.sdkPublishTime);
+				for (const NodePose& t_N : t_Stream.nodes)
+					printf(" %.6f %.6f %.6f %.7f %.7f %.7f %.7f",
+					       t_N.x, t_N.y, t_N.z, t_N.qw, t_N.qx, t_N.qy, t_N.qz);
+				printf("\n");
+			}
 		}
 		fflush(stdout);
 	}
