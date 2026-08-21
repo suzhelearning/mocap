@@ -133,3 +133,36 @@ pixi run view -- --connect-endpoint tcp/127.0.0.1:7447 --no-relay
 - Windows publisher 参数不变(`--zenoh-endpoint tcp/169.254.1.0:7447`,对面换为 router)
 - ⚠️ 若 Windows 侧使用 build_peer_config(关闭 scouting 的 peer 模式),连 router 可能
   不路由数据——遇此情况将 natnet 的连接改为 client 模式(见 acquisition/README.md 已知局限)
+
+## 新 PC 接入（有线，2026-08-19 起）
+
+**数据通道统一走有线 `169.254.1.0:7447`，不使用 WiFi。** Router 只监听
+`169.254.1.0:7447`（有线 enp127s0）+ `127.0.0.1`。ACL 已放行 `mocap/**`、
+`manus/**` 对任意对端的订阅，新 PC 无需改任何配置。
+
+网络前提：新 PC 以有线接入同一 169.254 网段——与 Ubuntu 接同一交换机
+（各自 APIPA 自动获得 169.254.x.x，无需 DHCP），或与 Ubuntu 直连。
+169.254.1.0 是 Ubuntu 有线口地址，交换机上任意设备均可访问。
+
+新 PC 步骤（任意语言，以下为 Python 示例）：
+
+接口说明与最小订阅示例见根目录 [RIGID_SUBSCRIBE.md](RIGID_SUBSCRIBE.md)（面向 agent 的完整文档）。
+
+裸用也可以：
+
+```python
+import zenoh
+conf = zenoh.Config.from_json5(
+    '{"mode":"client","connect":{"endpoints":["tcp/169.254.1.0:7447"]}}')
+with zenoh.open(conf) as s:
+    s.declare_subscriber("mocap/hands/frame",
+                         lambda sample: print(sample.payload.to_string()))
+    input("回车退出\n")
+```
+
+注意：
+
+- 数据无加密：ACL 只限制 key 空间、不校验身份，同网段主机理论上可订阅。
+- rigid 位姿在 `rigid_bodies` 数组（`id`/`position`/`quaternion_xyzw`/`mean_error`/`tracking_valid`），
+  名字→ID 映射在 `mocap/rigid_body_names`（5s 周期重发）。
+- 原始坐标为 Motive Y-up 右手系、单位米，消费端如需 Z-up 自行变换。

@@ -79,12 +79,16 @@ MANO_PALM_LINE_COLOR = (170, 170, 170)
 
 @dataclass(frozen=True)
 class TableSpec:
-    """桌面区域几何(Motive 世界系,米制):y=0 平面上的矩形框,无高度信息。"""
+    """桌面区域几何(Motive 世界系,米制):y=0 平面上的矩形框,无高度信息。
+
+    默认值与回放 viewer 一致(viser_core.TABLE_*):Motive 原点位于桌子近边,
+    中心沿 +z 偏移半个深度(1.440 × 0.900,中心 z=+0.45)。
+    """
 
     width: float = 1.440
     depth: float = 0.900
     center_x: float = 0.0
-    center_z: float = 0.0
+    center_z: float = 0.45
 
     def frame_segments(self) -> np.ndarray:
         """桌面区域矩形框四条边(y=0 平面)。"""
@@ -344,7 +348,7 @@ class StitchedScene:
             self._table_center_x_mm = self.server.gui.add_number(
                 "中心 X (mm)", initial_value=0, step=1)
             self._table_center_z_mm = self.server.gui.add_number(
-                "中心 Z (mm)", initial_value=0, step=1)
+                "中心 Z (mm)", initial_value=450, step=1)
 
         # -- 回调 ------------------------------------------------------------
         @self._btn_start.on_click

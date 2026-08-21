@@ -32,6 +32,8 @@ ssh -i ~/.ssh/id_ed25519_windows -l 'current robotics' 192.168.110.6
 ## Zenoh 数据通道（有线）
 
 - Ubuntu subscriber 监听：`tcp/0.0.0.0:7447`（所有接口）
+- 新 PC 消费（2026-08-19 起）：统一走**有线** `169.254.1.0:7447`，不使用 WiFi；
+  新 PC 与 Ubuntu 同交换机/直连接入 169.254 网段即可 connect 订阅，见 CONSUMING.md
 - Windows publisher 连接：`--zenoh-endpoint tcp/169.254.1.0:7447`（**必须用 169.254 段地址**）
 - key：`mocap/hands/frame`；顺序：先起 Ubuntu subscriber，再起 Windows publisher
 - 有线实测 ~0.3ms、0% 丢包（2026-08-07）

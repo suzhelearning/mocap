@@ -8,9 +8,9 @@ user: shd                           # 操作者:与 manus_pub.sh --user 一致;
                                     # 自动合并 offset/<user>.yaml 的 wrist 标定
 
 # Motive 中定义的刚体(Motive Y-up 右手系、米制)
-# ⚠ 命名勘误(用户确认):Motive 里名为 right_wrist 的刚体(id=1)实际在【左手】,
-#   名为 left_wrist(id=2)实际在【右手】;left_dip(id=4)在左手。以下按物理位置配置,
-#   勿再按 Motive 名字改回。
+# 名字已复核(2026-08-19,空间位置验证):当前与物理位置一致——
+#   id=1 left_wrist 在左手、id=2 right_wrist 在右手(与 right_arm 同侧)。
+# 早期 Motive 里名字曾起反,现按名字直接消费即可;以下按物理位置配置(id 引用不受影响)。
 rigid_bodies:
   back: 1
   objects:                         # 物体 ID→名；每个名称必须存在于 config/object_offsets.yaml
