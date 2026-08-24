@@ -170,11 +170,11 @@ def load_config(path: str | Path) -> Config:
             "rigid_bodies.back 未配置,所有 hands 都必须使用 wrist_rigid_id"
         )
 
-    axis = raw.get("axis_transform", {"permutation": [0, 2, 1], "signs": [1, 1, -1]})
+    axis = raw.get("axis_transform", {"permutation": [1, 0, 2], "signs": [-1, 1, 1]})
     if not isinstance(axis, dict):
         raise ConfigError("axis_transform 必须是映射")
-    perm = axis.get("permutation", [0, 2, 1])
-    signs = axis.get("signs", [1, 1, -1])
+    perm = axis.get("permutation", [1, 0, 2])
+    signs = axis.get("signs", [-1, 1, 1])
     if not (isinstance(perm, list) and isinstance(signs, list)
             and sorted(perm) == [0, 1, 2] and len(signs) == 3
             and all(s in (-1, 1) for s in signs)):

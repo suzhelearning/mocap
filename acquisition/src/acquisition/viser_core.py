@@ -331,10 +331,11 @@ def extract_hdf5(f: h5py.File) -> dict:
     }
 
 
-# 桌面道具(Motive 世界系,米制):Motive 原点位于桌子近边,中心沿 +z 偏移半个深度
-TABLE_WIDTH = 1.440
-TABLE_DEPTH = 0.900
-TABLE_CENTER = (0.0, TABLE_DEPTH / 2.0)   # (x, z):原点在 z=0 桌边,中心 z=+0.45
+# 桌面道具(Motive 世界系,米制):Motive 原点位于桌子近边,中心沿 +x 偏移半个深度
+# 坐标系:x 前向、z 向上(z=0 为地面平面)
+TABLE_WIDTH = 1.440                      # 桌面宽(沿 y 轴,左右方向)
+TABLE_DEPTH = 0.900                      # 桌面深(沿 x 轴,前后方向)
+TABLE_CENTER = (TABLE_DEPTH / 2.0, 0.0)  # (x, y):原点在 x=0 桌边,中心 x=+0.45
 TABLE_COLOR = (16, 185, 129)              # emerald,与实时可视化桌面同色
 
 
@@ -358,16 +359,16 @@ def build_scene_nodes(scene: viser.ViserScene, data: dict) -> SceneNodes:
     nodes = SceneNodes()
 
     grid = scene.add_grid(
-        "/grid", width=8.0, height=8.0, cell_size=0.1, plane="xz",
+        "/grid", width=8.0, height=8.0, cell_size=0.1, plane="xy",
         plane_color=(235, 240, 250), plane_opacity=0.15,
     )
     nodes.handles.append(grid)
-    # 桌面:半透明平面(与 TABLE_* 常量一致,Motive 世界系 y=0 平面)
-    cx, cz = TABLE_CENTER
-    x0, x1 = cx - TABLE_WIDTH / 2.0, cx + TABLE_WIDTH / 2.0
-    z0, z1 = cz - TABLE_DEPTH / 2.0, cz + TABLE_DEPTH / 2.0
+    # 桌面:半透明平面(与 TABLE_* 常量一致,Motive 世界系 z=0 平面)
+    cx, cy = TABLE_CENTER
+    x0, x1 = cx - TABLE_DEPTH / 2.0, cx + TABLE_DEPTH / 2.0
+    y0, y1 = cy - TABLE_WIDTH / 2.0, cy + TABLE_WIDTH / 2.0
     verts = np.asarray([
-        [x0, 0, z0], [x1, 0, z0], [x1, 0, z1], [x0, 0, z1],
+        [x0, y0, 0], [x1, y0, 0], [x1, y1, 0], [x0, y1, 0],
     ], dtype=np.float32)
     faces = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
     table = scene.add_mesh_simple(
@@ -380,7 +381,7 @@ def build_scene_nodes(scene: viser.ViserScene, data: dict) -> SceneNodes:
     for rid in sorted(data["rb_ids"]):
         label = RIGID_LABELS.get(rid, f"rigid:{rid}")
         fh = scene.add_frame(f"/world/rigid/{rid}", axes_length=0.15, axes_radius=0.008)
-        lb = scene.add_label(f"/world/rigid/{rid}/label", label, position=(0, 0.05, 0))
+        lb = scene.add_label(f"/world/rigid/{rid}/label", label, position=(0, 0, 0.05))
         nodes.rigid_frames[rid] = fh
         nodes.rigid_labels[rid] = lb
         nodes.handles.extend((fh, lb))
@@ -391,7 +392,7 @@ def build_scene_nodes(scene: viser.ViserScene, data: dict) -> SceneNodes:
         fh = scene.add_frame(
             f"/world/object/{name}", axes_length=0.02, axes_radius=0.0008)
         lb = scene.add_label(
-            f"/world/object/{name}/label", name, position=(0, 0.025, 0))
+            f"/world/object/{name}/label", name, position=(0, 0, 0.025))
         loaded = load_object_mesh(name)
         if loaded is not None:
             _path, vertices, faces = loaded
@@ -456,7 +457,7 @@ def apply_frame(nodes: SceneNodes, data: dict, t_ns: float) -> dict:
                 fh.position = pos
                 fh.wxyz = quat_xyzw_to_wxyz(quat)
                 fh.visible = True
-                nodes.rigid_labels[rid].position = (pos[0], pos[1] + 0.05, pos[2])
+                nodes.rigid_labels[rid].position = (pos[0], pos[1], pos[2] + 0.05)
                 nodes.rigid_labels[rid].visible = True
             else:
                 fh.visible = False
@@ -479,7 +480,7 @@ def apply_frame(nodes: SceneNodes, data: dict, t_ns: float) -> dict:
             fh.position = pos
             fh.wxyz = quat_xyzw_to_wxyz(quat)
             fh.visible = True
-            lb.position = (0.0, 0.025, 0.0)
+            lb.position = (0.0, 0.0, 0.025)
             lb.visible = True
             if mesh is not None:
                 mesh.visible = True

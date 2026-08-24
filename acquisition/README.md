@@ -22,8 +22,8 @@ Windows (Motive 3.4 + natnet-zenoh publisher)     Ubuntu 本机
                                                         └── 按键录制 → HDF5 v4
 ```
 
-坐标系:动捕为 Motive Y-up 右手系、米制;Manus 骨架为 z-up、米制(手套各自建系,
-拼接只用帧内相对量)。拼接公式与轴变换见 `config.yaml` 的 `axis_transform` 注释。
+坐标系:动捕为 Motive x 前向、z 向上右手系、米制(2026-08-24 起);Manus 骨架为 z-up、米制
+(手套各自建系,拼接只用帧内相对量)。拼接公式与轴变换见 `config.yaml` 的 `axis_transform` 注释。
 
 ## 目录结构
 
@@ -106,7 +106,7 @@ bash ../record.sh --object hammer cube  # 采集多种物体(--object 必须显�
 | `rigid_bodies.objects` | 物体刚体 ID → 名字(每个物体建一个刚体) |
 | `hands.<side>.wrist_offset` | 背部刚体身体系到手腕的偏移(需真机标定):`mode: body` 随躯干转动 / `world` 固定方向;可选 `yaw/pitch/roll_deg` 姿态修正 |
 | `hands.<side>.wrist_rigid_id` | 可选:若 Motive 直接追踪手腕刚体,用其位姿跳过 offset |
-| `axis_transform` | 骨架 z-up → Motive y-up 轴变换(permutation/signs,须为真旋转 det=+1);默认 A·d=(d_x, d_z, −d_y) |
+| `axis_transform` | 骨架 z-up → Motive(x 前向、z 向上)轴变换(permutation/signs,须为真旋转 det=+1);默认 A·d=(−d_y, d_x, d_z) |
 | `recording.output_dir` | 保存目录(临时文件 `.take_*_tmp.h5` 保存时原子改名) |
 | `alignment.output_hz` | 唯一公共输出频率；当前必须为 `60` |
 | `alignment.latency_ms` | 等待未来包围样本的固定缓冲；默认 `50 ms` |

@@ -83,7 +83,8 @@ v4 不保存 Motive/Manus 原始包、markers、插值来源、时钟拟合、�
 
 ## 手部数据
 
-`keypoints_world` 是世界坐标系中的 MediaPipe/MANO 21 点顺序：
+`keypoints_world` 是 Motive 世界坐标系中的 MediaPipe/MANO 21 点顺序
+（x 前向、z 向上右手系，米制；2026-08-24 起）：
 
 ```text
 0 wrist

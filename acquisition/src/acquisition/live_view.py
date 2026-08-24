@@ -5,7 +5,7 @@ UI 风格参考 NatNetViewerSource/src/natnet_zenoh/viewer.py:
 - Markdown 状态栏
 - 可折叠 folder:「录制控制」「视图」「桌面」
 - Marker 按跟踪状态配色(id_kind/occluded 红)
-- y-up 场景 + 桌面道具(操作物体场景参考)
+- z-up(x-forward)场景 + 桌面道具(操作物体场景参考)——Motive 全局系 2026-08-24 起已改为 x 前向、z 向上
 - 保留采集特有元素:双手骨架(chain 配色)、手腕/物体刚体、录制按钮/对齐状态
 
 手骨架配色常量复制自 manus/viz.py(manus 不是包,不可 import),来源已注明。
@@ -79,29 +79,30 @@ MANO_PALM_LINE_COLOR = (170, 170, 170)
 
 @dataclass(frozen=True)
 class TableSpec:
-    """桌面区域几何(Motive 世界系,米制):y=0 平面上的矩形框,无高度信息。
+    """桌面区域几何(Motive 世界系,米制):z=0 平面上的矩形框,无高度信息。
 
     默认值与回放 viewer 一致(viser_core.TABLE_*):Motive 原点位于桌子近边,
-    中心沿 +z 偏移半个深度(1.440 × 0.900,中心 z=+0.45)。
+    中心沿 +x 偏移半个深度(1.440 × 0.900,中心 x=+0.45)。
+    坐标系:x 前向、z 向上(2026-08-24 起),地面为 z=0 平面。
     """
 
-    width: float = 1.440
-    depth: float = 0.900
-    center_x: float = 0.0
-    center_z: float = 0.45
+    width: float = 1.440          # 桌面宽(沿 y 轴,即左右方向)
+    depth: float = 0.900          # 桌面深(沿 x 轴,即前后方向)
+    center_x: float = 0.45
+    center_y: float = 0.0
 
     def frame_segments(self) -> np.ndarray:
-        """桌面区域矩形框四条边(y=0 平面)。"""
-        x0 = self.center_x - self.width / 2.0
-        x1 = self.center_x + self.width / 2.0
-        z0 = self.center_z - self.depth / 2.0
-        z1 = self.center_z + self.depth / 2.0
+        """桌面区域矩形框四条边(z=0 平面)。"""
+        x0 = self.center_x - self.depth / 2.0
+        x1 = self.center_x + self.depth / 2.0
+        y0 = self.center_y - self.width / 2.0
+        y1 = self.center_y + self.width / 2.0
         return np.asarray(
             [
-                [[x0, 0.0, z0], [x1, 0.0, z0]],
-                [[x1, 0.0, z0], [x1, 0.0, z1]],
-                [[x1, 0.0, z1], [x0, 0.0, z1]],
-                [[x0, 0.0, z1], [x0, 0.0, z0]],
+                [[x0, y0, 0.0], [x1, y0, 0.0]],
+                [[x1, y0, 0.0], [x1, y1, 0.0]],
+                [[x1, y1, 0.0], [x0, y1, 0.0]],
+                [[x0, y1, 0.0], [x0, y0, 0.0]],
             ],
             dtype=np.float32,
         )
@@ -180,6 +181,9 @@ class StitchedScene:
         self._port = port or config.viz_port
         # 固定端口:冲突直接报错(viser 内部端口被占会静默 +1,采集页地址会漂移)
         with socket.socket() as _probe:
+            # 上一个 Viser/WebSocket 实例退出后，连接会短暂处于 TIME_WAIT。
+            # 此时没有监听进程，但普通 bind 仍会 EADDRINUSE；允许立即重启。
+            _probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 _probe.bind((host, self._port))
             except OSError:
@@ -199,15 +203,15 @@ class StitchedScene:
             show_share_button=False,
             brand_color=(16, 185, 129),
         )
-        self.server.scene.set_up_direction((0.0, 1.0, 0.0))   # Motive y-up
+        self.server.scene.set_up_direction((0.0, 0.0, 1.0))   # Motive x-forward z-up
         # 世界坐标轴(原点)会落在桌面中心遮挡手部:隐藏,坐标轴改由
         # _render_table 绘制在桌面区域左下角边缘
         self.server.scene.world_axes.visible = False
-        self.server.initial_camera.position = (2.2, 1.7, 2.2)
-        self.server.initial_camera.look_at = (0.0, 1.0, 0.0)
-        self.server.initial_camera.up_direction = (0.0, 1.0, 0.0)
+        self.server.initial_camera.position = (2.2, 2.2, 1.7)
+        self.server.initial_camera.look_at = (0.0, 0.0, 1.0)
+        self.server.initial_camera.up_direction = (0.0, 0.0, 1.0)
         self.grid = self.server.scene.add_grid(
-            "/ground", width=6.0, height=6.0, plane="xz",
+            "/ground", width=6.0, height=6.0, plane="xy",
             cell_size=0.1, section_size=1.0,
             cell_color=(71, 85, 105), section_color=(148, 163, 184),
             plane_opacity=0.04,
@@ -346,9 +350,9 @@ class StitchedScene:
             self._table_depth_mm = self.server.gui.add_number(
                 "深 (mm)", initial_value=900, min=1, step=1)
             self._table_center_x_mm = self.server.gui.add_number(
-                "中心 X (mm)", initial_value=0, step=1)
-            self._table_center_z_mm = self.server.gui.add_number(
-                "中心 Z (mm)", initial_value=450, step=1)
+                "中心 X (mm)", initial_value=450, step=1)
+            self._table_center_y_mm = self.server.gui.add_number(
+                "中心 Y (mm)", initial_value=0, step=1)
 
         # -- 回调 ------------------------------------------------------------
         @self._btn_start.on_click
@@ -380,7 +384,7 @@ class StitchedScene:
         self._reset_view.on_click(self._reset_cameras)
         self._show_table.on_update(self._update_table_visibility)
         for control in (self._table_width_mm, self._table_depth_mm,
-                        self._table_center_x_mm, self._table_center_z_mm):
+                        self._table_center_x_mm, self._table_center_y_mm):
             control.on_update(lambda _e: self._render_table())
 
         self.update_state(State.IDLE)     # 初始按钮态
@@ -418,16 +422,16 @@ class StitchedScene:
 
     def _reset_cameras(self, _event: object = None) -> None:
         for client in self.server.get_clients().values():
-            client.camera.position = (2.2, 1.7, 2.2)
-            client.camera.look_at = (0.0, 1.0, 0.0)
-            client.camera.up_direction = (0.0, 1.0, 0.0)
+            client.camera.position = (2.2, 2.2, 1.7)
+            client.camera.look_at = (0.0, 0.0, 1.0)
+            client.camera.up_direction = (0.0, 0.0, 1.0)
 
     def _table_spec(self) -> TableSpec:
         return TableSpec(
             width=float(self._table_width_mm.value) / 1000.0,
             depth=float(self._table_depth_mm.value) / 1000.0,
             center_x=float(self._table_center_x_mm.value) / 1000.0,
-            center_z=float(self._table_center_z_mm.value) / 1000.0,
+            center_y=float(self._table_center_y_mm.value) / 1000.0,
         )
 
     def _render_table(self) -> None:
@@ -447,7 +451,7 @@ class StitchedScene:
             self.server.scene.add_label(
                 "/table/size",
                 text=f"{int(self._table_width_mm.value)} × {int(self._table_depth_mm.value)} mm",
-                position=(spec.center_x, 0.0, spec.center_z - spec.depth / 2.0 - 0.02),
+                position=(spec.center_x - spec.depth / 2.0 - 0.02, spec.center_y, 0.0),
                 anchor="bottom-center",
                 font_screen_scale=0.8,
                 visible=visible,
@@ -455,8 +459,8 @@ class StitchedScene:
             # 方向参考坐标轴:位于桌面区域左下角外侧(不遮挡手部)
             self.server.scene.add_frame(
                 "/table/axes", wxyz=(1, 0, 0, 0),
-                position=(spec.center_x - spec.width / 2.0 - 0.05, 0.0,
-                          spec.center_z - spec.depth / 2.0 - 0.05),
+                position=(spec.center_x - spec.depth / 2.0 - 0.05,
+                          spec.center_y - spec.width / 2.0 - 0.05, 0.0),
                 axes_length=0.08, axes_radius=0.003,
                 visible=visible,
             ),
@@ -573,7 +577,7 @@ class StitchedScene:
                     frame.visible = rigid_visible
                     self._object_labels[name].visible = rigid_visible
                     self._object_labels[name].position = (
-                        position + np.array([0.0, 0.06, 0.0])
+                        position + np.array([0.0, 0.0, 0.06])
                     )
                 else:
                     frame.visible = False

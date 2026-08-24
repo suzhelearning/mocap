@@ -74,19 +74,19 @@ class VizScene:
 
         self.server = ViserServer(host="127.0.0.1", port=port)
         self.server.gui.configure_theme(dark_mode=True)   # 黑色主题
-        # Motive 数据是 y-up；通过 viser 官方 up-direction 机制保持 y-up。
+        # Motive 数据是 x-forward z-up；通过 viser 官方 up-direction 机制保持 z-up。
         # 这样根节点负责统一变换，数据、相机和灯光处在同一个坐标约定中；
-        # 不再手动把 y-up 数据旋到 z-up，也不覆盖 viser 的根节点姿态。
-        self.server.scene.set_up_direction((0.0, 1.0, 0.0))
-        self.server.initial_camera.position = (0.038, 4.176, -5.413)
-        self.server.initial_camera.look_at = (0.0, 1.0, 0.0)
-        self.server.initial_camera.up = (0.0, -1.0, 0.0)
+        # 不再手动把 z-up 数据旋到 y-up，也不覆盖 viser 的根节点姿态。
+        self.server.scene.set_up_direction((0.0, 0.0, 1.0))
+        self.server.initial_camera.position = (-5.413, 0.038, 4.176)
+        self.server.initial_camera.look_at = (0.0, 0.0, 1.0)
+        self.server.initial_camera.up = (0.0, 0.0, -1.0)
         self.server.initial_camera.fov = 50.0
-        # 每次连接（含断线重连）强制回到同一 y-up 俯视姿态。
+        # 每次连接（含断线重连）强制回到同一 z-up 俯视姿态。
         self.server.on_client_connect(self._reset_camera)
-        # 数据/桌面整体抬高 1m；原始 H5 坐标不修改，地面 grid 仍在 y=0。
+        # 数据/桌面整体抬高 1m；原始 H5 坐标不修改，地面 grid 仍在 z=0。
         self.world_frame = self.server.scene.add_frame(
-            "/world", position=(0.0, 1.0, 0.0), show_axes=False,
+            "/world", position=(0.0, 0.0, 1.0), show_axes=False,
         )
         self._scene_ready = False
         self._anim_thread = threading.Thread(
@@ -95,10 +95,10 @@ class VizScene:
         self._anim_thread.start()
 
     def _reset_camera(self, client: viser.ClientHandle) -> None:
-        """连接回调:强制相机回到默认视角（y-up 世界,画面上下翻转）。"""
-        client.camera.position = (0.038, 4.176, -5.413)
-        client.camera.look_at = (0.0, 1.0, 0.0)
-        client.camera.up_direction = (0.0, -1.0, 0.0)
+        """连接回调:强制相机回到默认视角(z-up 世界,画面上下翻转)。"""
+        client.camera.position = (-5.413, 0.038, 4.176)
+        client.camera.look_at = (0.0, 0.0, 1.0)
+        client.camera.up_direction = (0.0, 0.0, -1.0)
 
     def _camera_state(self) -> dict | None:
         """取最近更新的客户端相机状态(viser 世界坐标),无客户端返回 None。"""

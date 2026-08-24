@@ -516,8 +516,8 @@ def main() -> int:
         cfg_raw = _pyyaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
         back_id_cfg = cfg_raw["hands"][args.side]["back_rigid_id"]
         ax = cfg_raw.get("axis_transform", {})
-        perm = ax.get("permutation", [0, 2, 1])
-        signs = ax.get("signs", [1, 1, -1])
+        perm = ax.get("permutation", [1, 0, 2])
+        signs = ax.get("signs", [-1, 1, 1])
         A = np.zeros((3, 3), dtype=float)
         for j in range(3):
             A[j, perm[j]] = signs[j]

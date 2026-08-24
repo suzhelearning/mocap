@@ -58,15 +58,15 @@ def test_euler_wxyz_yaw_90():
 
 
 def test_compose_axis_default():
-    """默认 A·d = (d_x, d_z, -d_y)(骨架 z-up → motive y-up)。"""
-    A = compose_axis([0, 2, 1], [1, 1, -1])
-    assert np.allclose(A @ np.array([1.0, 2.0, 3.0]), [1.0, 3.0, -2.0])
+    """默认 A·d = (-d_y, d_x, d_z)(骨架 z-up → motive x-forward z-up)。"""
+    A = compose_axis([1, 0, 2], [-1, 1, 1])
+    assert np.allclose(A @ np.array([1.0, 2.0, 3.0]), [-2.0, 1.0, 3.0])
     assert np.isclose(np.linalg.det(A), 1.0)
 
 
 @pytest.mark.parametrize("perm,signs,det", [
     ([0, 1, 2], [1, 1, 1], 1.0),     # 恒等
-    ([0, 2, 1], [1, 1, -1], 1.0),    # 默认(绕 X -90°)
+    ([1, 0, 2], [-1, 1, 1], 1.0),    # 默认(绕 Y +90°)
     ([1, 2, 0], [1, 1, 1], 1.0),     # 循环移位
     ([0, 2, 1], [1, 1, 1], -1.0),    # 镜像(应被 config 拒绝)
 ])

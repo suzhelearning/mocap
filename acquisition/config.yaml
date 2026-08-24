@@ -7,16 +7,15 @@ router:
 user: shd                           # 操作者:与 manus_pub.sh --user 一致;
                                     # 自动合并 offset/<user>.yaml 的 wrist 标定
 
-# Motive 中定义的刚体(Motive Y-up 右手系、米制)
-# 名字已复核(2026-08-19,空间位置验证):当前与物理位置一致——
-#   id=1 left_wrist 在左手、id=2 right_wrist 在右手(与 right_arm 同侧)。
-# 早期 Motive 里名字曾起反,现按名字直接消费即可;以下按物理位置配置(id 引用不受影响)。
+# Motive 中定义的刚体(Motive x-forward z-up 右手系、米制)
+# 2026-08-24 更新:Motive 全局坐标系已改为 x 前向(forward)、z 向上(up),
+# 刚体 ID 已重排——id=1 left_wrist、id=2 right_wrist、id=3 right_arm、
+# id=4 hammer(旧 cylinder=3 / cube=8 / hammer=9 不再适用)。
+# 如需采集 cylinder/cube,先在 Motive 中建对应刚体再加入 objects。
 rigid_bodies:
-  back: 1
+  back: 1                          # 左手腕刚体(与 hands.left.back_rigid_id 一致)
   objects:                         # 物体 ID→名；每个名称必须存在于 config/object_offsets.yaml
-    cylinder: 3
-    cube: 8
-    hammer: 9
+    hammer: 4
 
 hands:
   left:
@@ -43,9 +42,9 @@ hands:
       roll_deg: 97.47
   # 若 Motive 直接追踪手腕刚体(无 offset 场景),改用 wrist_rigid_id 即可
 
-axis_transform:                    # Manus 骨架(z-up) → Motive 系(y-up) 轴变换
-  permutation: [0, 2, 1]           # 输出 = (输入[0], 输入[2], 输入[1])
-  signs: [1, 1, -1]                # A·d = (d_x, d_z, -d_y) = 绕 X -90°
+axis_transform:                    # Manus 骨架(z-up) → Motive 系(x-forward z-up) 轴变换
+  permutation: [1, 0, 2]           # 输出 = (输入[1], 输入[0], 输入[2])
+  signs: [-1, 1, 1]                # A·d = (-d_y, d_x, d_z) = 绕 Y +90°
   # 标定:开 live_view 看手指方向;上/下颠倒改 signs,左/右颠倒改 permutation
 
 recording:

@@ -2,7 +2,7 @@
 """track_rigid.py — 按名字/ID 提取动捕刚体位姿：实时监控 + JSONL 记录 + 位移测量。
 
 订阅 zenoh 动捕流（``mocap/hands/frame``，120Hz，坐标系
-``motive_y_up_right_handed``、单位米），按名字（``mocap/rigid_body_names``）
+``motive_x_forward_z_up_right_handed``（x 前向、z 向上）、单位米），按名字（``mocap/rigid_body_names``）
 或 ID 提取刚体（如天机右臂末端刚体 ``right_arm`` id=10），用于：
 
 - 在线监控：实时打印位姿、帧率、跟踪误差与有效率；

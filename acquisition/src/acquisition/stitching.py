@@ -1,7 +1,8 @@
 """手腕位姿计算 + 手部骨架拼接(纯函数,拼接公式见计划文档)。
 
 坐标系:
-- Motive 系 M:y-up 右手系、米制(rigid body 的 position/quaternion_xyzw 所在系)
+- Motive 系 M:x-forward z-up 右手系、米制(rigid body 的 position/quaternion_xyzw 所在系,
+  2026-08-24 起 Motive 全局坐标系已改为 x 前向、z 向上)
 - 骨架系 S:z-up 右手系、米制(manus raw_skeleton 节点,每手套各自建系,
   拼接只用帧内相对量,与 S 世界原点无关)
 

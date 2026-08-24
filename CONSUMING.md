@@ -67,7 +67,7 @@ with zenoh.open(config) as session:
   "frame_number": 12345,
   "motive_timestamp": 105.341,
   "publisher_received_time_ns": 1784000000000000000,
-  "coordinate_system": "motive_y_up_right_handed",
+  "coordinate_system": "motive_x_forward_z_up_right_handed",
   "unit": "meter",
   "publisher_dropped_frames": 0,
   "markers": [
@@ -91,7 +91,7 @@ with zenoh.open(config) as session:
 
 ### 字段语义
 
-- **坐标系/单位**：Motive 原始右手 **Y-up** 全局坐标，位置为**米**；消费端如需其他习惯（如 Z-up）必须自行变换
+- **坐标系/单位**：Motive 全局坐标 x 前向、z 向上（右手系，`motive_x_forward_z_up_right_handed`），位置为**米**；消费端如需其他习惯必须自行变换
 - **`id_kind`**：`asset_member`（model_id/member_id 可作稳定身份）、`point_cloud`（raw_id 是当前跟踪段 ID，**遮挡后可能改变**，不能当永久标签）、`active`、`unknown`
 - **`occluded` / `model_filled`**：位置可能来自模型填充而非当前帧直接观测
 - **`publisher_dropped_frames`**：发布端累计丢帧计数（单调递增，看增量）
@@ -165,4 +165,4 @@ with zenoh.open(conf) as s:
 - 数据无加密：ACL 只限制 key 空间、不校验身份，同网段主机理论上可订阅。
 - rigid 位姿在 `rigid_bodies` 数组（`id`/`position`/`quaternion_xyzw`/`mean_error`/`tracking_valid`），
   名字→ID 映射在 `mocap/rigid_body_names`（5s 周期重发）。
-- 原始坐标为 Motive Y-up 右手系、单位米，消费端如需 Z-up 自行变换。
+- 原始坐标为 Motive x 前向、z 向上右手系、单位米，消费端如需其他习惯自行变换。

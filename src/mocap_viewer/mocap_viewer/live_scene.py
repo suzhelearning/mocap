@@ -98,8 +98,8 @@ class LiveScene:
 
     def _configure_camera(self) -> None:
         look_at = np.asarray([0.0, 0.0, 0.0])
-        position = np.asarray([0.6, -0.6, 0.35])  # y-up 世界，俯视手部区域
-        up = np.asarray([0.0, 1.0, 0.0])
+        position = np.asarray([0.6, -0.6, 0.35])  # z-up(x-forward) 世界,俯视手部区域
+        up = np.asarray([0.0, 0.0, 1.0])
         self.server.initial_camera.look_at = look_at
         self.server.initial_camera.position = position
         self.server.initial_camera.up = up

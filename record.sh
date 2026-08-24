@@ -17,6 +17,11 @@ if ! ss -ltn 2>/dev/null | grep -q ':7447'; then
     exit 1
 fi
 
+# 启动前按端口清理上一实例及任何 8081 监听进程，避免 Viser
+# 报 "Address already in use"。VISE_PORT 可覆盖默认端口。
+VISE_PORT="${VISE_PORT:-8081}"
+bash "$SCRIPT_DIR/clean_record.sh" "$VISE_PORT"
+
 echo "[record] 浏览器打开 http://127.0.0.1:8081 (q 或 Ctrl-C 退出)"
 echo "[record] 录制控制见 web 左侧面板;键盘 r/s/d 同样可用"
 cd "$ACQ_DIR"

@@ -4,7 +4,7 @@
 输入两段同步采集的位姿序列（各 K 个“保持位姿”窗口）：
 
 - motive：``track_rigid record`` 的 JSONL（动捕实测 right_arm 末端位姿，
-  Motive 系 y-up、米制）；
+  Motive 系 x 前向、z 向上、米制）；
 - robot：机器人侧同一末端位姿的 JSONL（同构：每行
   ``{"t_ns": ..., "position": [...], "quaternion_xyzw": [...]}``；
   sim 下取 ``/pico_body_sim/right_arm/solved_pose``（FK，right_chest 系），

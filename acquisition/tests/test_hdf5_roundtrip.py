@@ -60,7 +60,7 @@ def _mocap(t_ns: int, sequence: int) -> dict:
         "frame_number": sequence,
         "motive_timestamp": sequence / 120,
         "publisher_received_time_ns": t_ns + 3_000_000,
-        "coordinate_system": "motive_y_up_right_handed",
+        "coordinate_system": "motive_x_forward_z_up_right_handed",
         "unit": "meter",
         "publisher_dropped_frames": 0,
         "t_phys_ns": t_ns,

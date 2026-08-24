@@ -57,7 +57,7 @@ def make_frame(number: int = 1, markers=None, rigid_bodies=None) -> dict:
         "frame_number": number,
         "motive_timestamp": 1.25,
         "publisher_received_time_ns": 123456789,
-        "coordinate_system": "motive_y_up_right_handed",
+        "coordinate_system": "motive_x_forward_z_up_right_handed",
         "unit": "meter",
         "publisher_dropped_frames": 0,
         "markers": markers if markers is not None else [],

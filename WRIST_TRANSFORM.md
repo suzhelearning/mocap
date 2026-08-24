@@ -7,7 +7,7 @@
 
 | | 内容 | 单位/约定 |
 |---|---|---|
-| 输入 | 刚体 `position` (3,) | 米，Motive 世界系（Y-up 右手系） |
+| 输入 | 刚体 `position` (3,) | 米，Motive 世界系（x 前向、z 向上右手系） |
 | 输入 | 刚体 `quaternion_xyzw` (4,) | 四元数，**xyzw 序** |
 | 输入 | 标定 `wrist_offset` | `xyz`（米）+ `yaw/pitch/roll_deg` + `mode` |
 | 输出 | 手腕 `position` (3,) | 米，Motive 世界系 |
@@ -151,5 +151,5 @@ def back_to_wrist(pos_b, quat_b_xyzw, offset_xyz, yaw_deg, pitch_deg, roll_deg):
 ## 注意事项
 
 - 四元数协议为 **xyzw 序**（NatNet 线格式）；内部计算统一 wxyz 序，仅在边界转换。
-- 坐标系为 Motive **Y-up 右手系**、单位米；消费端如需 Z-up 自行变换。
+- 坐标系为 Motive **x 前向、z 向上右手系**（2026-08-24 起）、单位米；消费端如需其他习惯自行变换。
 - 刚体 `tracking_valid=false` 时位姿不可信，不应做转换使用。

@@ -29,7 +29,7 @@
   "schema_version": 1,
   "frame_number": 14151299,
   "motive_timestamp": 105.341,
-  "coordinate_system": "motive_y_up_right_handed",
+  "coordinate_system": "motive_x_forward_z_up_right_handed",
   "unit": "meter",
   "publisher_dropped_frames": 0,
   "rigid_bodies": [
@@ -56,7 +56,7 @@
 
 ### 坐标系
 
-Motive 原始 **Y-up 右手系**（`motive_y_up_right_handed`），消费端如需 Z-up 等习惯必须自行变换。
+Motive 全局 **x 前向、z 向上**右手系（`motive_x_forward_z_up_right_handed`），消费端如需其他习惯必须自行变换。
 
 ### 丢帧检测
 
