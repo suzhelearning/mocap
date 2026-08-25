@@ -344,11 +344,14 @@ wrapper 自带 `--apply`，同时更新：
 acquisition/config.yaml
 ```
 
+每个操作者都必须有自己的 `offset/<user>.yaml`，且同时包含 left/right。录制入口强制要求
+`--user <name>`；文件不存在、缺任一侧或字段不完整时会拒绝启动并打印标定命令。
+
 运行中的采集进程不会热加载 offset。标定后必须重启：
 
 ```bash
 cd ~/syz/mocap
-bash record.sh --object hammer tianji_wrist
+bash record.sh --object hammer tianji_wrist --user shd
 ```
 
 ## 10. 标定后验证

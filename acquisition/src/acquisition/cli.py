@@ -1,8 +1,8 @@
 """采集程序主入口:装配 StreamHub + 拼接 + 可视化 + 按键/按钮录制。
 
-用法:
-    pixi run record                # 带 web 可视化
-    pixi run record-noviz          # 不带可视化(纯采集)
+用法(--user 必填且 offset/<user>.yaml 必须含左右标定):
+    pixi run record -- --object hammer --user shd
+    pixi run record-noviz -- --object hammer tianji_wrist --user shd
 
 按键(默认):r 开始录制 / s 保存 / d 丢弃 / q 退出
 浏览器:http://<host>:8081(可视化模式)——「录制控制」面板同功能按钮。
@@ -71,6 +71,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="人类操作演示数据采集")
     ap.add_argument("--config", type=str, default="config.yaml",
                     help="配置文件路径(默认 config.yaml)")
+    ap.add_argument("--user", required=True,
+                    help="操作者名字;必须存在 offset/<user>.yaml 的左右手标定")
     ap.add_argument("--no-viz", action="store_true",
                     help="不启动 web 可视化(纯采集)")
     ap.add_argument("--host", type=str, default="127.0.0.1",
@@ -86,7 +88,11 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(
+            args.config,
+            user=args.user,
+            require_user_calibration=True,
+        )
     except ConfigError as exc:
         print(f"[错误] 配置加载失败: {exc}", file=sys.stderr)
         return 2

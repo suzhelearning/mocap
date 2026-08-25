@@ -72,7 +72,7 @@ web 左侧「录制控制」按钮与键盘(r/s/d)等价。输出固定 60 Hz；
 | `mocap/` | `pixi run view / subscribe / test` | 动捕可视化/消费/测试 |
 | `mocap/acquisition/` | `pixi run record / inspect / replay / test` | 采集/检查/回放/测试 |
 | `mocap/acquisition/` | `pixi run add-object-offset -- <object> --gl-mm X Y Z --go-deg P Y R` | 写入 Motive Visuals 物体外参 |
-| `mocap/acquisition/` | `pixi run python scripts/e2e_check.py --seconds 5` | 端到端验证(需真实流) |
+| `mocap/acquisition/` | `pixi run python scripts/e2e_check.py --seconds 5 --user shd --object hammer` | 端到端验证(需真实流和用户左右标定) |
 
 ## 关键说明
 

@@ -285,3 +285,63 @@ recording: { output_dir: "captures" }
     cfg = load_config(cfg_path)
     assert cfg.user == "shd"
     assert cfg.hands["left"].wrist_offset.xyz == (0.0, 0.0, 0.0)
+
+
+def _write_strict_record_config(tmp_path, *, user: str = "base"):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"""
+router: {{ endpoint: "tcp/127.0.0.1:7447" }}
+user: {user}
+rigid_bodies: {{ back: 1, objects: {{ hammer: 4 }} }}
+hands:
+  left:  {{ back_rigid_id: 1 }}
+  right: {{ back_rigid_id: 2 }}
+recording: {{ output_dir: "captures" }}
+""")
+    return path
+
+
+def test_recording_requires_named_user_calibration_file(tmp_path):
+    path = _write_strict_record_config(tmp_path)
+    with pytest.raises(ConfigError, match="用户 'alice'.*标定文件不存在"):
+        load_config(path, user="alice", require_user_calibration=True)
+
+
+def test_recording_rejects_one_sided_calibration(tmp_path):
+    path = _write_strict_record_config(tmp_path)
+    (tmp_path / "offset").mkdir()
+    (tmp_path / "offset" / "alice.yaml").write_text("""
+left:
+  mode: body
+  xyz: [0.1, 0.2, 0.3]
+  yaw_deg: 1
+  pitch_deg: 2
+  roll_deg: 3
+""")
+    with pytest.raises(ConfigError, match="缺少 right 标定"):
+        load_config(path, user="alice", require_user_calibration=True)
+
+
+def test_recording_named_user_loads_complete_bilateral_calibration(tmp_path):
+    path = _write_strict_record_config(tmp_path, user="ignored")
+    (tmp_path / "offset").mkdir()
+    (tmp_path / "offset" / "alice.yaml").write_text("""
+left:
+  mode: body
+  xyz: [0.1, 0.2, 0.3]
+  yaw_deg: 1
+  pitch_deg: 2
+  roll_deg: 3
+right:
+  mode: body
+  xyz: [-0.1, -0.2, -0.3]
+  yaw_deg: -1
+  pitch_deg: -2
+  roll_deg: -3
+""")
+    cfg = load_config(path, user="alice", require_user_calibration=True)
+    assert cfg.user == "alice"
+    assert cfg.hands["left"].wrist_offset.xyz == (0.1, 0.2, 0.3)
+    assert cfg.hands["right"].wrist_offset.xyz == (-0.1, -0.2, -0.3)
+    assert "yaw_deg: 1.0" in cfg.config_text
+    assert yaml.safe_load(cfg.config_text)["user"] == "alice"

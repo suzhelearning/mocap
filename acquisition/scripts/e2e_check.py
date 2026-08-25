@@ -24,6 +24,10 @@ def _captures(root: Path) -> set[Path]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--user", required=True,
+                        help="操作者;必须有 offset/<user>.yaml 左右手标定")
+    parser.add_argument("--object", action="extend", nargs="+", required=True,
+                        help="采集物体,如 --object hammer tianji_wrist")
     parser.add_argument("--seconds", type=float, default=5.0)
     parser.add_argument("--viz", action="store_true",
                         help="E2E 时也启动 Viser（默认纯采集）")
@@ -34,14 +38,19 @@ def main(argv: list[str] | None = None) -> int:
     config_path = Path(args.config)
     if not config_path.is_absolute():
         config_path = (ROOT / config_path).resolve()
-    cfg = load_config(config_path)
+    cfg = load_config(
+        config_path, user=args.user, require_user_calibration=True,
+    )
     output_dir = cfg.output_dir
     before = _captures(output_dir) if output_dir.exists() else set()
     started_ns = time.time_ns()
 
     master, slave = pty.openpty()
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
-    cmd = [sys.executable, "-m", "acquisition.cli", "--config", str(config_path)]
+    cmd = [
+        sys.executable, "-m", "acquisition.cli", "--config", str(config_path),
+        "--user", args.user, "--object", *args.object,
+    ]
     if not args.viz:
         cmd.append("--no-viz")
     proc = subprocess.Popen(

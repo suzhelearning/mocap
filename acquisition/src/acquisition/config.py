@@ -91,17 +91,28 @@ def _parse_offset(data: object, path: str) -> WristOffset:
     if not (isinstance(xyz, (list, tuple)) and len(xyz) == 3
             and all(isinstance(v, (int, float)) for v in xyz)):
         raise ConfigError(f"{path}.xyz 必须是 3 个数字")
+    values = [*(float(v) for v in xyz),
+              float(data.get("yaw_deg", 0.0)),
+              float(data.get("pitch_deg", 0.0)),
+              float(data.get("roll_deg", 0.0))]
+    if not np.isfinite(values).all():
+        raise ConfigError(f"{path} 含 NaN/Inf")
     return WristOffset(
         mode=mode,
-        xyz=tuple(float(v) for v in xyz),
-        yaw_deg=float(data.get("yaw_deg", 0.0)),
-        pitch_deg=float(data.get("pitch_deg", 0.0)),
-        roll_deg=float(data.get("roll_deg", 0.0)),
+        xyz=tuple(values[:3]),
+        yaw_deg=values[3],
+        pitch_deg=values[4],
+        roll_deg=values[5],
     )
 
 
-def load_config(path: str | Path) -> Config:
-    """加载 yaml 并校验,失败抛 ConfigError。"""
+def load_config(
+    path: str | Path,
+    *,
+    user: str | None = None,
+    require_user_calibration: bool = False,
+) -> Config:
+    """加载 YAML;录制模式可强制指定用户并要求左右手标定文件。"""
     path = Path(path)
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -228,7 +239,14 @@ def load_config(path: str | Path) -> Config:
     viz = raw.get("viz", {})
     viz_port = int(viz.get("port", 8081)) if isinstance(viz, dict) else 8081
 
-    user = str(raw.get("user", "default"))
+    selected_user = user if user is not None else str(raw.get("user", "default"))
+    selected_user = selected_user.strip()
+    if not selected_user or any(
+        not (char.isalnum() or char in "_-") for char in selected_user
+    ):
+        raise ConfigError("user 只能包含字母、数字、下划线和连字符")
+    if require_user_calibration and selected_user == "default":
+        raise ConfigError("录制必须显式指定真实用户:--user <name>,不能使用 default")
 
     base_config_text = path.read_text(encoding="utf-8")
     cfg = Config(
@@ -246,18 +264,19 @@ def load_config(path: str | Path) -> Config:
         keymap=keymap,
         viz_port=viz_port,
         chunk_frames=chunk_frames,
-        user=user,
+        user=selected_user,
         config_path=path.resolve(),
         config_text=base_config_text,
         base_config_text=base_config_text,
     )
     # 合并按用户标定的 offset:offset/<user>.yaml 覆盖 hands.<side>.wrist_offset
-    return _merge_user_offset(cfg)
+    return _merge_user_offset(cfg, required=require_user_calibration)
 
 
 def _effective_config_text(cfg: Config, hands: dict[str, HandConfig]) -> str:
     """把用户 offset 合并进原配置，生成可独立复现的有效配置快照。"""
     raw = yaml.safe_load(cfg.base_config_text)
+    raw["user"] = cfg.user
     for side, hand in hands.items():
         offset = hand.wrist_offset
         raw["hands"][side]["wrist_offset"] = {
@@ -270,27 +289,56 @@ def _effective_config_text(cfg: Config, hands: dict[str, HandConfig]) -> str:
     return yaml.safe_dump(raw, allow_unicode=True, sort_keys=False)
 
 
-def _merge_user_offset(cfg: Config) -> Config:
-    """用 offset/<user>.yaml 覆盖 wrist_offset，并保存有效配置快照。"""
+def _calibration_error(cfg: Config, detail: str) -> ConfigError:
+    path = cfg.config_path.parent / "offset" / f"{cfg.user}.yaml"
+    return ConfigError(
+        f"用户 {cfg.user!r} 未完成有效的左右手腕标定:{detail}\n"
+        f"期望文件:{path}\n"
+        "请先运行:\n"
+        f"  bash acquisition/scripts/calibrate_wrist_offset.sh left --user {cfg.user} "
+        "--back-name left_back --landmarks config/wrist_landmarks.yaml "
+        "--hold 3 --max-rms-mm 5 --max-direction-deg 15\n"
+        f"  bash acquisition/scripts/calibrate_wrist_offset.sh right --user {cfg.user} "
+        "--back-name right_back --landmarks config/wrist_landmarks.yaml "
+        "--hold 3 --max-rms-mm 5 --max-direction-deg 15"
+    )
+
+
+def _merge_user_offset(cfg: Config, *, required: bool = False) -> Config:
+    """用 offset/<user>.yaml 覆盖 wrist_offset;录制模式严格要求左右手完整标定。"""
     offset_path = cfg.config_path.parent / "offset" / f"{cfg.user}.yaml"
     if not offset_path.is_file():
+        if required:
+            raise _calibration_error(cfg, "标定文件不存在")
         return cfg
     try:
         calibration_text = offset_path.read_text(encoding="utf-8")
         raw = yaml.safe_load(calibration_text)
-    except (OSError, yaml.YAMLError):
+    except (OSError, yaml.YAMLError) as exc:
+        if required:
+            raise _calibration_error(cfg, f"标定文件无法解析:{exc}") from exc
         return cfg
     if not isinstance(raw, dict):
+        if required:
+            raise _calibration_error(cfg, "标定文件根必须是映射")
         return cfg
     hands = dict(cfg.hands)
-    applied = False
+    applied: set[str] = set()
+    required_fields = {"mode", "xyz", "yaw_deg", "pitch_deg", "roll_deg"}
     for side in ("left", "right"):
         data = raw.get(side)
         if not isinstance(data, dict):
+            if required:
+                raise _calibration_error(cfg, f"缺少 {side} 标定")
             continue
+        missing = sorted(required_fields - set(data))
+        if required and missing:
+            raise _calibration_error(cfg, f"{side} 缺少字段:{', '.join(missing)}")
         try:
             offset = _parse_offset(data, f"offset/{cfg.user}.yaml.{side}")
-        except ConfigError:
+        except (ConfigError, TypeError, ValueError) as exc:
+            if required:
+                raise _calibration_error(cfg, f"{side} 标定不合法:{exc}") from exc
             continue
         hand = hands[side]
         hands[side] = HandConfig(
@@ -299,7 +347,9 @@ def _merge_user_offset(cfg: Config) -> Config:
             wrist_offset=offset,
             wrist_rigid_id=hand.wrist_rigid_id,
         )
-        applied = True
+        applied.add(side)
+    if required and applied != {"left", "right"}:
+        raise _calibration_error(cfg, "必须同时包含 left/right")
     if not applied:
         return cfg
     return Config(

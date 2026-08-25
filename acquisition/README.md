@@ -51,8 +51,8 @@ acquisition/
 pixi run start-router                    # 前台运行(带 ACL)
 bash scripts/install_zenohd_service.sh --start   # 或装常驻 systemd 服务
 
-# 2. 采集(带可视化,浏览器 http://127.0.0.1:8081)
-pixi run record
+# 2. 采集(带可视化,浏览器 http://127.0.0.1:8081;user 必填且须完成左右标定)
+pixi run record -- --object hammer --user shd
 # 按键: r 开始录制 / s 保存 / d 丢弃 / q 退出
 # 无数据流入时状态栏提示「⏳ 等待设备启动」,设备就绪后自动恢复
 
@@ -73,8 +73,8 @@ bash ../manus_pub.sh --user syz             # 用 calibration/syzLeft/RightMetag
 bash ../windows_pub.sh
 
 # 路线 3/3:数据 web 订阅与收集(本程序,web :8081 + 录制按钮)
-bash ../record.sh --object cylinder     # 只采集一种物体
-bash ../record.sh --object hammer cube  # 采集多种物体(--object 必须显式指定)
+bash ../record.sh --object hammer --user shd
+bash ../record.sh --object hammer tianji_wrist --user shd
 ```
 
 三条路线独立启动/停止、任意顺序(router 常驻即可)。无数据流入时采集程序
@@ -93,7 +93,7 @@ bash ../record.sh --object hammer cube  # 采集多种物体(--object 必须显�
 不能配齐的 tick 保留并标无效，不通过各流独立门控来丢帧。
 
 > 端到端一键验证(需真实动捕 + manus 流):
-> `pixi run python scripts/e2e_check.py --seconds 5`。
+> `pixi run python scripts/e2e_check.py --seconds 5 --user shd --object hammer`。
 >
 > 本目录位于合并后的 `mocap/acquisition/`,natnet(../natnet)与 manus(../manus)
 > 为同级子目录;zenohd 二进制在 `../manus/.pixi`(启动脚本按相对位置自动定位)。

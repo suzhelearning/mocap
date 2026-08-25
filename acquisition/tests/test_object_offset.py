@@ -163,6 +163,12 @@ def test_cli_refuses_configured_object_without_offset(
         f"recording: {{output_dir: {tmp_path / 'captures'}}}\n",
         encoding="utf-8",
     )
+    (tmp_path / "offset").mkdir()
+    (tmp_path / "offset" / "alice.yaml").write_text(
+        "left: {mode: body, xyz: [0,0,0], yaw_deg: 0, pitch_deg: 0, roll_deg: 0}\n"
+        "right: {mode: body, xyz: [0,0,0], yaw_deg: 0, pitch_deg: 0, roll_deg: 0}\n",
+        encoding="utf-8",
+    )
     cylinder = load_object_offsets(DEFAULT_OBJECT_OFFSETS_PATH)["cylinder"]
     monkeypatch.setattr(
         acquisition_cli,
@@ -171,7 +177,7 @@ def test_cli_refuses_configured_object_without_offset(
     )
 
     assert acquisition_cli.main([
-        "--config", str(config), "--no-viz",
+        "--config", str(config), "--no-viz", "--object", "cup", "--user", "alice",
     ]) == 2
     error = capsys.readouterr().err
     assert "cup" in error
