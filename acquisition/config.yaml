@@ -9,13 +9,14 @@ user: shd                           # 操作者:与 manus_pub.sh --user 一致;
 
 # Motive 中定义的刚体(Motive x-forward z-up 右手系、米制)
 # 2026-08-24 更新:Motive 全局坐标系已改为 x 前向(forward)、z 向上(up),
-# 刚体 ID 已重排——id=1 left_wrist、id=2 right_wrist、id=3 right_arm、
+# 刚体 ID 已重排——id=1 left_wrist、id=2 right_wrist、id=3 tianji_wrist(原 right_arm)、
 # id=4 hammer(旧 cylinder=3 / cube=8 / hammer=9 不再适用)。
 # 如需采集 cylinder/cube,先在 Motive 中建对应刚体再加入 objects。
 rigid_bodies:
   back: 1                          # 左手腕刚体(与 hands.left.back_rigid_id 一致)
   objects:                         # 物体 ID→名；每个名称必须存在于 config/object_offsets.yaml
     hammer: 4
+    tianji_wrist: 3
 
 hands:
   left:
