@@ -1,7 +1,7 @@
 # 动捕刚体 → 真实手腕位姿转换说明
 
-本文档说明如何把 Motive 动捕刚体（手背 marker 刚体，如 `left_wrist`）的位姿，
-转换为真实手腕（腕关节中心）位姿。适用于消费端复现转换逻辑，或理解采集链路输出。
+本文档说明如何把 Motive 手背 marker 刚体（`left_back` / `right_back`）的位姿，
+转换为真实解剖手腕（腕关节中心）位姿。刚体名明确为 back,避免误以为其原点就是手腕。
 
 ## 输入 / 输出
 
@@ -55,14 +55,14 @@ yaw=绕 Z、pitch=绕 Y、roll=绕 X，按 Z→Y→X 复合，单位度。
 
 ## 当前标定值（`acquisition/config.yaml`）
 
-✅ **左右手已复核（2026-08-19）**：当前 Motive 名字与物理位置**一致**——
-`left_wrist`（id=1）在物理左手、`right_wrist`（id=2）在物理右手
-（空间位置验证：id=2 与 `right_arm`（id=10）同侧）。
-早期 Motive 里名字曾起反（历史勘误注释已过时），现按名字直接消费即可。
+✅ **左右手已复核（2026-08-25）**：Motive 名字与物理位置一致——
+`left_back`（id=1）在物理左手背、`right_back`（id=2）在物理右手背。
+Streaming 已输出 x 前向/y 左/z 上世界位姿;下面的 body offset 是刚体局部外参,
+不会再做 Streaming Up Axis 转换。
 
 ```yaml
 hands:
-  left:                       # 物理左手（Motive 名 right_wrist, id=1）
+  left:                       # 物理左手（Motive 名 left_back,id=1）
     back_rigid_id: 1
     wrist_offset:
       mode: body
@@ -70,7 +70,7 @@ hands:
       yaw_deg:    -135.19
       pitch_deg:  -70.4
       roll_deg:   149.43
-  right:                      # 物理右手（Motive 名 left_wrist, id=2）
+  right:                      # 物理右手（Motive 名 right_back,id=2）
     back_rigid_id: 2
     wrist_offset:
       mode: body

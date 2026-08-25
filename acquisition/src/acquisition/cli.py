@@ -210,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                 calib_rigid_ids={
                     rigid_id
                     for name in (
-                        "left_wrist", "left_dip", "right_wrist", "right_dip",
+                        "left_back", "left_dip", "right_back", "right_dip",
                     )
                     if (rigid_id := hub.rigid_body_id(name)) is not None
                 },

@@ -23,8 +23,8 @@ hands:
     back_rigid_id: 5
     wrist_offset: { mode: body, xyz: [-0.15, -0.30, -0.05] }
 axis_transform:
-  permutation: [1, 0, 2]
-  signs: [-1, 1, 1]
+  permutation: [0, 2, 1]
+  signs: [1, 1, -1]
 recording:
   output_dir: "captures"
 keys:
@@ -65,8 +65,8 @@ def test_load_sample():
 def test_axis_matrix_default():
     cfg = _load(SAMPLE)
     A = cfg.axis_matrix()
-    # A·d = (-d_y, d_x, d_z)
-    assert np.allclose(A @ np.array([1.0, 2.0, 3.0]), [-2.0, 1.0, 3.0])
+    # A·d = (d_x, d_z, -d_y):Manus 局部系→手腕局部系
+    assert np.allclose(A @ np.array([1.0, 2.0, 3.0]), [1.0, 3.0, -2.0])
     assert np.isclose(np.linalg.det(A), 1.0)
 
 
@@ -88,7 +88,7 @@ hands:
 
 def test_mirror_axis_rejected():
     """perm [0,2,1] + signs [1,1,1] 合成 det=-1(镜像),必须拒绝。"""
-    bad = SAMPLE.replace("signs: [-1, 1, 1]", "signs: [1, 1, 1]")
+    bad = SAMPLE.replace("signs: [1, 1, -1]", "signs: [1, 1, 1]")
     with pytest.raises(ConfigError, match="不是真旋转"):
         _load(bad)
 
@@ -121,7 +121,7 @@ hands:
 """
     cfg = _load(minimal)
     assert cfg.hands["left"].wrist_offset.mode == "body"
-    assert cfg.axis_permutation == (1, 0, 2)
+    assert cfg.axis_permutation == (0, 2, 1)
     assert cfg.keymap == {"start": "r", "save": "s",
                           "discard": "d", "quit": "q"}
     assert cfg.alignment_hz == 60.0
@@ -235,7 +235,7 @@ rigid_bodies:
 hands:
   left:  { back_rigid_id: 2, wrist_offset: { mode: body, xyz: [0, 0, 0] } }
   right: { back_rigid_id: 1, wrist_offset: { mode: body, xyz: [0, 0, 0] } }
-axis_transform: { permutation: [1, 0, 2], signs: [-1, 1, 1] }
+axis_transform: { permutation: [0, 2, 1], signs: [1, 1, -1] }
 alignment: { output_hz: 60, latency_ms: 50 }
 recording: { output_dir: "captures" }
 """)
@@ -276,7 +276,7 @@ rigid_bodies:
 hands:
   left:  { back_rigid_id: 2 }
   right: { back_rigid_id: 1 }
-axis_transform: { permutation: [1, 0, 2], signs: [-1, 1, 1] }
+axis_transform: { permutation: [0, 2, 1], signs: [1, 1, -1] }
 alignment: { output_hz: 60, latency_ms: 50 }
 recording: { output_dir: "captures" }
 """)

@@ -22,8 +22,9 @@ Windows (Motive 3.4 + natnet-zenoh publisher)     Ubuntu 本机
                                                         └── 按键录制 → HDF5 v4
 ```
 
-坐标系:动捕为 Motive x 前向、z 向上右手系、米制(2026-08-24 起);Manus 骨架为 z-up、米制
-(手套各自建系,拼接只用帧内相对量)。拼接公式与轴变换见 `config.yaml` 的 `axis_transform` 注释。
+坐标系:Motive 内部为 x 前向/y 向上/z 向右;Streaming Z-up 输出
+x 前向/y 向左/z 向上右手系、米制。刚体 position/quaternion 已在该世界系,消费端不重复转换。
+Manus 骨架为 z-up 手套局部系;只用帧内相对量,经局部轴对齐 A 和手腕刚体 pose 放到世界。
 
 ## 目录结构
 
@@ -102,11 +103,11 @@ bash ../record.sh --object hammer cube  # 采集多种物体(--object 必须显�
 | 项 | 说明 |
 |---|---|
 | `router.endpoint` | zenohd 地址,本机 `tcp/127.0.0.1:7447` |
-| `rigid_bodies.back` | Motive 背部 markers 刚体 ID |
+| `rigid_bodies.back` | Motive 手背/腕刚体 ID;Streaming 已把位姿转成 z-up 世界系 |
 | `rigid_bodies.objects` | 物体刚体 ID → 名字(每个物体建一个刚体) |
-| `hands.<side>.wrist_offset` | 背部刚体身体系到手腕的偏移(需真机标定):`mode: body` 随躯干转动 / `world` 固定方向;可选 `yaw/pitch/roll_deg` 姿态修正 |
-| `hands.<side>.wrist_rigid_id` | 可选:若 Motive 直接追踪手腕刚体,用其位姿跳过 offset |
-| `axis_transform` | 骨架 z-up → Motive(x 前向、z 向上)轴变换(permutation/signs,须为真旋转 det=+1);默认 A·d=(−d_y, d_x, d_z) |
+| `hands.<side>.wrist_offset` | 手背刚体局部系 B 到解剖手腕局部系 W 的固定外参:`mode: body` 推荐且不受 Streaming 世界轴变化影响;`world` 才是固定世界方向 |
+| `hands.<side>.wrist_rigid_id` | 可选:若 Motive 直接追踪解剖手腕刚体,用其位姿跳过 offset |
+| `axis_transform` | Manus 骨架局部系 H → 手腕局部系 W 的轴对齐(permutation/signs,det=+1);默认 A·d=(d_x,d_z,−d_y),不是世界坐标变换 |
 | `recording.output_dir` | 保存目录(临时文件 `.take_*_tmp.h5` 保存时原子改名) |
 | `alignment.output_hz` | 唯一公共输出频率；当前必须为 `60` |
 | `alignment.latency_ms` | 等待未来包围样本的固定缓冲；默认 `50 ms` |
@@ -114,10 +115,19 @@ bash ../record.sh --object hammer cube  # 采集多种物体(--object 必须显�
 | `alignment.manus_max_gap_ms` | Manus 包围样本允许的最大间隔 |
 | `keys` | 键位:start/pause/save/discard/quit |
 
-**真机标定流程**:
-1. Motive 建"背部刚体"+ 各物体刚体;Windows publisher 参数不变
-2. 静止站立,记录手腕实际位置,反推 `wrist_offset.xyz`
-3. 开 live 视图看手指方向:上/下颠倒改 `signs`,左/右颠倒改 `permutation`
+**五指桌面地标标定（无需新增 Motive 刚体）**:
+1. 十个反光点摆好且静止后执行
+   `pixi run capture-wrist-landmarks`，自动按 +Y→-Y 排序、3 秒平均并写 `config/wrist_landmarks.yaml`;旧配置保存为 `.yaml.bak`。
+2. 在球心投影处画十字并移走反光球;配置使用桌面接触面 z=0,不能直接触碰球顶。
+3. 五指 fingertip 同时压住对应点:thumb=24,index=5,middle=10,ring=15,little=20。
+4. 左手:
+   `bash scripts/calibrate_wrist_offset.sh left --user shd --back-name left_back --landmarks config/wrist_landmarks.yaml --hold 3 --max-rms-mm 5 --max-direction-deg 15`
+5. 右手同理,将 `left/left_back` 改成 `right/right_back`。
+6. 成功后写 `offset/shd.yaml` 并同步 `config.yaml`;质量门失败不会覆盖旧标定。
+7. 重启 `record.sh`,检查 Manus root 与 wrist_position 重合、五指方向正确。
+
+完整原理、十点坐标、实测指标和故障排查见
+[`docs/FINGERTIP_LANDMARK_WRIST_CALIBRATION.md`](docs/FINGERTIP_LANDMARK_WRIST_CALIBRATION.md)。
 
 ## HDF5 文件结构（schema 4.0）
 

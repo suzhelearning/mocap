@@ -48,6 +48,7 @@ MOVE_ANG_DEG = 1.5          # 姿态变化 >1.5°/帧 视为移动
 MAX_RMS_MM = 2.0
 MAX_DIRECTION_DEG = 10.0
 MAX_LOO_POSITION_MM = 10.0
+LANDMARK_MAX_LOO_POSITION_MM = 15.0
 MIN_VECTOR_SPREAD_DEG = 25.0
 MIN_SECOND_SPAN_MM = 3.0
 
@@ -58,6 +59,38 @@ POSE_HINTS = [
     "掌心朝右,中指沿手掌完全伸直",
     "掌心朝自己,中指半弯约 45°",
 ]
+
+def load_landmarks(path: str | Path, side: str) -> list[tuple[str, int, np.ndarray]]:
+    """读取五指已知世界坐标；单位米、世界系为 x前/y左/z上。"""
+    yaml = ruamel.yaml.YAML(typ="safe")
+    raw = yaml.load(Path(path).read_text(encoding="utf-8"))
+    hands = raw.get("hands") if isinstance(raw, dict) else None
+    items = hands.get(side) if isinstance(hands, dict) else None
+    if not isinstance(items, list):
+        raise ValueError(f"landmarks 文件必须含 hands.{side} 列表")
+    if raw.get("unit", "meter") != "meter":
+        raise ValueError("landmarks.unit 当前只支持 meter")
+    result: list[tuple[str, int, np.ndarray]] = []
+    names: set[str] = set()
+    nodes: set[int] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"hands.{side}[{index}] 必须是映射")
+        name = str(item.get("name", f"point_{index + 1}"))
+        node = int(item.get("node", -1))
+        xyz = np.asarray(item.get("xyz"), dtype=float)
+        if xyz.shape != (3,) or not np.isfinite(xyz).all():
+            raise ValueError(f"hands.{side}[{index}].xyz 必须是 3 个有限数")
+        if not 0 <= node < 25:
+            raise ValueError(f"hands.{side}[{index}].node 必须在 0..24")
+        if name in names or node in nodes:
+            raise ValueError(f"hands.{side} 的 name/node 不得重复:{name}/{node}")
+        names.add(name)
+        nodes.add(node)
+        result.append((name, node, xyz))
+    if len(result) < 3:
+        raise ValueError("地标至少需要 3 个非共线 fingertip,推荐 5 个")
+    return result
 
 
 def build_session(endpoint: str) -> zenoh.Session:
@@ -71,7 +104,7 @@ def build_session(endpoint: str) -> zenoh.Session:
 class LiveStreams:
     """缓存最新 mocap 帧与 manus 骨架(zenoh 回调线程写入)。"""
 
-    def __init__(self, endpoint: str, side: str, ref_rigid_id: int):
+    def __init__(self, endpoint: str, side: str, ref_rigid_id: int | None):
         self._session = build_session(endpoint)
         self._lock = threading.Lock()
         self._mocap: dict | None = None
@@ -127,8 +160,10 @@ class LiveStreams:
             with self._lock:
                 self._nodes = nodes
 
-    def snapshot(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-        """返回 (back_pos, back_quat_xyzw, nodes, ref_pos) 或 None。"""
+    def snapshot(
+        self, ref_position: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        """返回 (back_pos,back_quat_xyzw,nodes,ref_pos);地标模式直接使用给定 ref_position。"""
         with self._lock:
             if self._mocap is None or self._nodes is None:
                 return None
@@ -138,14 +173,18 @@ class LiveStreams:
         for rb in mocap.get("rigid_bodies", []):
             if rb.get("id") == self.back_id:
                 back = rb
-            elif rb.get("id") == self.ref_rigid_id:
+            elif self.ref_rigid_id is not None and rb.get("id") == self.ref_rigid_id:
                 ref = rb
-        if back is None or ref is None:
+        if back is None:
             return None
+        if ref_position is None:
+            if ref is None:
+                return None
+            ref_position = np.asarray(ref["position"], dtype=float)
         return (np.asarray(back["position"], dtype=float),
                 np.asarray(back["quaternion_xyzw"], dtype=float),
                 np.asarray(nodes, dtype=float),
-                np.asarray(ref["position"], dtype=float))
+                np.asarray(ref_position, dtype=float))
 
     def close(self) -> None:
         for sub in self._subs:
@@ -156,12 +195,14 @@ class LiveStreams:
         self._session.close()
 
 
-def collect_pose(streams: LiveStreams, hold_s: float, ref_node: int) -> list:
-    """采集 hold_s 秒的帧序列:(p_b, q_b, nodes, p_ref),参照刚体缺失的帧跳过。"""
+def collect_pose(
+    streams: LiveStreams, hold_s: float, ref_position: np.ndarray | None = None,
+) -> list:
+    """采集 hold_s 秒帧序列;地标模式以固定 ref_position 替代参照刚体位置。"""
     frames = []
     deadline = time.time() + hold_s
     while time.time() < deadline:
-        snap = streams.snapshot()
+        snap = streams.snapshot(ref_position=ref_position)
         if snap is not None:
             frames.append(snap)
         time.sleep(0.01)
@@ -191,11 +232,10 @@ def static_check(frames) -> tuple[bool, float, float, float]:
 
 
 def pose_average(frames, ref_node: int, axis: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """姿势样本:窗口平均的 (p_b, q_b_xyzw, v_ref, p_ref)。
+    """单参照点样本:(p_b,q_b_xyzw,v_ref,p_ref)。
 
-    v_ref = A·(参照节点 − 手掌 root):先做骨架系→Motive 轴约定变换,
-    使标定解出的 R_gb 只含贴装残余旋转(与拼接公式 g = p_w + R_w·A·d 一致,
-    避免 A 被 R_gb 吸收后双重旋转)。
+    v_ref=A·(参照节点−手掌root),A 只做 Manus H→手腕 W 的局部轴对齐;
+    标定解出的 R_gb 是手腕 W→手背刚体 B 的残余贴装旋转。
     """
     poss = np.asarray([f[0] for f in frames]).mean(axis=0)
     mid = frames[len(frames) // 2][1]                 # 四元数取中间帧
@@ -203,6 +243,19 @@ def pose_average(frames, ref_node: int, axis: np.ndarray) -> tuple[np.ndarray, n
     v_ref = axis @ (nodes[ref_node] - nodes[0])       # 轴变换后的参照向量
     p_ref = np.asarray([f[3] for f in frames]).mean(axis=0)
     return poss, mid, v_ref, p_ref
+
+def fingertip_landmark_samples(
+    frames, landmarks: list[tuple[str, int, np.ndarray]], axis: np.ndarray,
+) -> list:
+    """同一静止窗口的多指接触点 → Kabsch 样本;每根手指贡献一个世界对应点。"""
+    p_b = np.asarray([f[0] for f in frames]).mean(axis=0)
+    q_b = np.asarray(frames[len(frames) // 2][1], dtype=float)
+    nodes = np.asarray([f[2] for f in frames]).mean(axis=0)
+    samples = []
+    for _name, node, p_ref in landmarks:
+        v_ref = axis @ (nodes[node] - nodes[0])
+        samples.append((p_b, q_b, v_ref, np.asarray(p_ref, dtype=float)))
+    return samples
 
 
 def euler_to_rotmat(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
@@ -338,6 +391,7 @@ def quality_errors(
     *,
     max_rms_mm: float = MAX_RMS_MM,
     max_direction_deg: float = MAX_DIRECTION_DEG,
+    max_loo_position_mm: float = MAX_LOO_POSITION_MM,
 ) -> tuple[list[str], dict[str, float]]:
     """返回阻止写配置的质量错误及完整指标。"""
     diversity = pose_diversity(samples)
@@ -360,10 +414,10 @@ def quality_errors(
             f">{max_direction_deg:.1f}°")
     if not bool(metrics["loo_valid"]):
         errors.append("留一交叉验证退化，姿势仍不足以约束旋转")
-    elif metrics["loo_position_max_mm"] > MAX_LOO_POSITION_MM:
+    elif metrics["loo_position_max_mm"] > max_loo_position_mm:
         errors.append(
             f"留一位置误差 {metrics['loo_position_max_mm']:.1f}mm"
-            f">{MAX_LOO_POSITION_MM:.1f}mm")
+            f">{max_loo_position_mm:.1f}mm")
     elif metrics["loo_direction_max_deg"] > max_direction_deg:
         errors.append(
             f"留一方向误差 {metrics['loo_direction_max_deg']:.1f}°"
@@ -457,7 +511,7 @@ def run_auto(streams: LiveStreams, args, back_id: int, axis: np.ndarray) -> list
         input(f"[标定] 姿势 {i + 1}/{args.poses}:{hint}。摆好后按 Enter 开始")
         while True:
             print(f"[标定]   采集 {args.hold:.0f}s,请保持静止...", flush=True)
-            frames = collect_pose(streams, args.hold, args.node)
+            frames = collect_pose(streams, args.hold)
             ok, pos_mm, ang_deg, ref_mm = static_check(frames)
             if not ok:
                 print(f"[标定]   检测到手部移动(位移 {pos_mm:.1f}mm / "
@@ -471,6 +525,32 @@ def run_auto(streams: LiveStreams, args, back_id: int, axis: np.ndarray) -> list
             break
     return samples
 
+def run_fingertip_landmarks(
+    streams: LiveStreams,
+    args,
+    axis: np.ndarray,
+    landmarks: list[tuple[str, int, np.ndarray]],
+) -> list:
+    """五指同时触碰五个已知桌面点;单个静止窗口产生多组非共线对应点。"""
+    print("[标定] 五指桌面地标模式:确认每根手指与下列点一一对应:")
+    for name, node, xyz in landmarks:
+        print(f"[标定]   {name:>7s}: Manus node {node:2d} → world {xyz.tolist()} m")
+    input("[标定] 五指全部压住对应标记且手背稳定后,按 Enter 开始")
+    while True:
+        print(f"[标定] 采集 {args.hold:.0f}s,请五指同时保持接触...", flush=True)
+        # 地标世界坐标在样本组装时逐指写入;这里只需绕过参照刚体依赖。
+        frames = collect_pose(streams, args.hold, ref_position=np.zeros(3))
+        ok, pos_mm, ang_deg, ref_mm = static_check(frames)
+        if not ok:
+            print(f"[标定] 检测到移动(位移 {pos_mm:.1f}mm / 姿态 {ang_deg:.1f}°"
+                  f" / 骨架 {ref_mm:.1f}mm),请重新压住五点", file=sys.stderr)
+            input("[标定] 重新摆好后按 Enter")
+            continue
+        samples = fingertip_landmark_samples(frames, landmarks, axis)
+        print(f"[标定] 五指采集完成(位移 {pos_mm:.1f}mm,姿态 {ang_deg:.1f}°,"
+              f"骨架 {ref_mm:.1f}mm)")
+        return samples
+
 
 def solve(samples) -> tuple[np.ndarray, float]:
     """刚体配准求解 [o(3), yaw, pitch, roll]；质量门由 quality_errors 执行。"""
@@ -482,20 +562,23 @@ def main() -> int:
     ap.add_argument("--side", choices=["left", "right"], required=True)
     ap.add_argument("--config", default="config.yaml", help="运行时配置(读 back 刚体 id)")
     ap.add_argument("--router", default="tcp/127.0.0.1:7447")
-    ap.add_argument("--ref-rigid-id", type=int, default=None,
-                    help="参照点刚体 id(与 --ref-name 二选一;默认优先 --ref-name)")
-    ap.add_argument("--ref-name", default="left_dip",
-                    help="参照点刚体名字(如 left_dip;从 mocap/rigid_body_names 解析 id)")
+    ref_group = ap.add_mutually_exclusive_group()
+    ref_group.add_argument("--ref-rigid-id", type=int, default=None,
+                           help="参照点刚体 id(与 --ref-name 二选一)")
+    ref_group.add_argument("--ref-name", default=None,
+                           help="参照点刚体名字;默认按 side 使用 left_dip/right_dip")
+    ref_group.add_argument("--landmarks", type=Path, default=None,
+                           help="五指桌面地标 YAML;启用后不需要参照刚体")
     ap.add_argument("--back-name", default=None,
-                    help="手背刚体名字(如 left_wrist;缺省用 config 的 back_rigid_id)")
+                    help="手背刚体名字(如 left_back;缺省用 config 的 back_rigid_id)")
     ap.add_argument("--node", type=int, default=9,
-                    help="参照骨架节点索引(默认 9 = 中指 DIP)")
-    ap.add_argument("--poses", type=int, default=5, help="标定姿势数(推荐 4~6)")
-    ap.add_argument("--hold", type=float, default=3.0, help="每姿势采集秒数")
+                    help="单点参照模式的 Manus 节点(默认 9=中指 DIP;地标模式从 YAML 读取)")
+    ap.add_argument("--poses", type=int, default=5, help="单点参照模式姿势数(推荐 4~6)")
+    ap.add_argument("--hold", type=float, default=3.0, help="每次静止采集秒数")
     ap.add_argument("--settle", type=float, default=0.5,
                     help="自动模式:静止确认时长(秒)")
     ap.add_argument("--auto", action="store_true",
-                    help="自动模式:检测静止段自动采集,无需按 Enter")
+                    help="分段模式:每姿势按 Enter,段内自动静止检测与重采")
     ap.add_argument("--user", default="default",
                     help="操作者名字:结果写入 offset/<user>.yaml(按人区分标定)")
     ap.add_argument("--apply", action="store_true",
@@ -505,32 +588,51 @@ def main() -> int:
                     help=f"写配置允许的位置 RMS 上限(默认 {MAX_RMS_MM:g}mm)")
     ap.add_argument("--max-direction-deg", type=float, default=MAX_DIRECTION_DEG,
                     help=f"写配置允许的方向误差上限(默认 {MAX_DIRECTION_DEG:g}°)")
+    ap.add_argument("--max-loo-position-mm", type=float, default=None,
+                    help="留一位置误差门限;默认单点10mm、五指地标15mm")
     args = ap.parse_args()
+    landmarks = None
+    if args.landmarks is not None:
+        try:
+            landmarks = load_landmarks(args.landmarks, args.side)
+        except (OSError, ValueError, ruamel.yaml.YAMLError) as exc:
+            print(f"[标定] 读取地标失败:{exc}", file=sys.stderr)
+            return 2
+    if args.max_loo_position_mm is None:
+        args.max_loo_position_mm = (
+            LANDMARK_MAX_LOO_POSITION_MM if landmarks is not None
+            else MAX_LOO_POSITION_MM
+        )
+    if landmarks is None and args.ref_name is None and args.ref_rigid_id is None:
+        args.ref_name = f"{args.side}_dip"
 
     global args_node
     args_node = args.node
 
-    # 读 config:back 刚体 id 与轴变换 A(骨架系→Motive 系)
+    # 读 config:手背刚体 id 与轴变换 A(Manus 骨架局部系→手腕局部系)
     try:
         import yaml as _pyyaml
         cfg_raw = _pyyaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
         back_id_cfg = cfg_raw["hands"][args.side]["back_rigid_id"]
         ax = cfg_raw.get("axis_transform", {})
-        perm = ax.get("permutation", [1, 0, 2])
-        signs = ax.get("signs", [-1, 1, 1])
+        perm = ax.get("permutation", [0, 2, 1])
+        signs = ax.get("signs", [1, 1, -1])
         A = np.zeros((3, 3), dtype=float)
         for j in range(3):
             A[j, perm[j]] = signs[j]
     except Exception as exc:
         print(f"[标定] 读取 {args.config} 失败: {exc}", file=sys.stderr)
         return 2
+    ref_label = (
+        f"landmarks:{args.landmarks}" if landmarks is not None
+        else args.ref_name or f"id#{args.ref_rigid_id}"
+    )
 
     print(f"[标定] 侧={args.side}  back刚体=config#{back_id_cfg}"
-          f"  参照刚体=名字[{args.ref_name}] 参照节点索引={args.node}"
-          f"  姿势数={args.poses}")
+          f"  参照={ref_label}")
     print("[标定] 连接数据流,请确认手套与 Motive 均在发布数据...")
 
-    streams = LiveStreams(args.router, args.side, 0)   # ref id 稍后按名字解析
+    streams = LiveStreams(args.router, args.side, None)   # 参照 id 稍后按模式解析
     try:
         # 等待数据 + 刚体名字表就绪
         deadline = time.time() + 15
@@ -539,35 +641,48 @@ def main() -> int:
         while time.time() < deadline:
             with streams._lock:
                 names_ready = bool(streams._rigid_body_ids)
-            if args.ref_name:
-                ref_id = streams.rigid_body_id(args.ref_name)
-            elif args.ref_rigid_id is not None:
-                ref_id = args.ref_rigid_id
+            if landmarks is None:
+                if args.ref_name:
+                    ref_id = streams.rigid_body_id(args.ref_name)
+                elif args.ref_rigid_id is not None:
+                    ref_id = args.ref_rigid_id
             if args.back_name:
                 back_id = streams.rigid_body_id(args.back_name)
             else:
                 back_id = back_id_cfg
-            if names_ready and ref_id is not None and back_id is not None:
+            ref_ready = landmarks is not None or ref_id is not None
+            names_required = args.back_name is not None or (
+                landmarks is None and args.ref_name is not None
+            )
+            if ref_ready and back_id is not None and (names_ready or not names_required):
                 break
             time.sleep(0.2)
-        if ref_id is None or back_id is None:
-            print(f"[标定] 无法解析刚体: 参照[{args.ref_name}]→{ref_id}, "
-                  f"back[{args.back_name or 'config#' + str(back_id_cfg)}]→{back_id}",
+        if back_id is None or (landmarks is None and ref_id is None):
+            print(f"[标定] 无法解析:参照[{ref_label}]→{ref_id},"
+                  f" back[{args.back_name or 'config#' + str(back_id_cfg)}]→{back_id}",
                   file=sys.stderr)
-            print("[标定] 提示:请确认 Windows publisher 已更新并发布"
-                  " mocap/rigid_body_names(刚体名字表)", file=sys.stderr)
+            print("[标定] 提示:请确认 Windows publisher 名字表和 landmarks 文件",
+                  file=sys.stderr)
             return 1
         streams.ref_rigid_id = ref_id
         streams.back_id = back_id
-        print(f"[标定] 刚体解析: back={args.back_name or back_id_cfg}→id {back_id}, "
-              f"参照={args.ref_name}→id {ref_id}")
+        print(f"[标定] 解析完成:back={args.back_name or back_id_cfg}→id {back_id},"
+              f" 参照={ref_label}")
 
-        if streams.snapshot() is None:
-            print("[标定] 未收到帧数据(检查 router/手套/动捕),退出",
+        initial_ref = np.zeros(3) if landmarks is not None else None
+        data_deadline = time.time() + 5.0
+        while time.time() < data_deadline:
+            if streams.snapshot(ref_position=initial_ref) is not None:
+                break
+            time.sleep(0.1)
+        else:
+            print("[标定] 5 秒内未同时收到 Motive back 与 Manus 骨架,退出",
                   file=sys.stderr)
             return 1
 
-        if args.auto:
+        if landmarks is not None:
+            samples = run_fingertip_landmarks(streams, args, A, landmarks)
+        elif args.auto:
             samples = run_auto(streams, args, back_id, A)
         else:
             samples = []
@@ -576,7 +691,7 @@ def main() -> int:
                 input(f"[标定] 姿势 {i + 1}/{args.poses}:{hint}。摆好后按 Enter 开始采集")
                 while True:
                     print(f"[标定]   采集 {args.hold:.0f}s,请保持静止...", flush=True)
-                    frames = collect_pose(streams, args.hold, args.node)
+                    frames = collect_pose(streams, args.hold)
                     ok, pos_mm, ang_deg, ref_mm = static_check(frames)
                     if not ok:
                         print(f"[标定]   检测到手部移动(位移 {pos_mm:.1f}mm / 姿态 {ang_deg:.1f}°"
@@ -599,7 +714,7 @@ def main() -> int:
             print("[标定] 质量门拒绝:姿势多样性不足，旧配置保持不变", file=sys.stderr)
             print(f"[标定] 方向覆盖 {diversity['spread_deg']:.1f}°，"
                   f"second span {diversity['second_span_mm']:.1f}mm", file=sys.stderr)
-            print("[标定] 请使用中指直伸、半弯、深弯三种非共线手型重新采集",
+            print("[标定] 请增加非共线 fingertip 地标,或使用中指直伸/半弯/深弯姿势",
                   file=sys.stderr)
             return 1
         theta, rms = solve(samples)
@@ -615,6 +730,7 @@ def main() -> int:
             samples, theta, rms,
             max_rms_mm=args.max_rms_mm,
             max_direction_deg=args.max_direction_deg,
+            max_loo_position_mm=args.max_loo_position_mm,
         )
         print("\n[标定] ===== 求解完成 =====")
         print(f"[标定] 位置 RMS: {metrics['rms_mm']:.2f} mm"
@@ -623,11 +739,17 @@ def main() -> int:
               f"{metrics['direction_max_deg']:.1f}°")
         print(f"[标定] 姿势覆盖: {metrics['spread_deg']:.1f}°，"
               f"second span {metrics['second_span_mm']:.1f}mm")
-        print(f"[标定] 留一最大误差: {metrics['loo_position_max_mm']:.1f}mm / "
+        print(f"[标定] 留一最大误差: {metrics['loo_position_max_mm']:.1f}mm"
+              f"(门限 {args.max_loo_position_mm:.1f}mm) / "
               f"{metrics['loo_direction_max_deg']:.1f}°")
         print(f"[标定] wrist_offset.xyz = {result['xyz']}")
         print(f"[标定] yaw={result['yaw_deg']}°  pitch={result['pitch_deg']}°"
               f"  roll={result['roll_deg']}°")
+        if landmarks is not None:
+            print("[标定] 五指拟合残差:")
+            for (name, _node, _xyz), sample in zip(landmarks, samples):
+                err_mm = float(np.linalg.norm(residuals(theta, [sample])) * 1000.0)
+                print(f"[标定]   {name:>7s}: {err_mm:.2f}mm")
         if errors:
             print("[标定] ===== 质量门拒绝，未写入任何配置 =====", file=sys.stderr)
             for error in errors:

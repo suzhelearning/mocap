@@ -5,10 +5,12 @@ from __future__ import annotations
 import numpy as np
 
 from acquisition.config import WristOffset
-from acquisition.kinematics import compose_axis, euler_wxyz, quat_mul, quat_rotate
+from acquisition.kinematics import (
+    compose_axis, euler_wxyz, quat_mul, quat_rotate, quat_wxyz_to_xyzw,
+)
 from acquisition.stitching import hand_nodes_to_global, stitch_hand, wrist_pose_from_back
 
-AXIS = compose_axis([1, 0, 2], [-1, 1, 1])   # A·d = (-d_y, d_x, d_z)
+AXIS = compose_axis([0, 2, 1], [1, 1, -1])   # H→W:A·d = (d_x,d_z,-d_y)
 
 
 def _skeleton_frame() -> np.ndarray:
@@ -19,11 +21,11 @@ def _skeleton_frame() -> np.ndarray:
     return nodes
 
 
-def test_hand_nodes_to_global_no_back_rotation():
-    """情形 A:背部刚体无旋转,offset body 模式。"""
+def test_hand_nodes_to_global_with_identity_wrist_pose():
+    """纯函数情形:手腕世界姿态为单位阵;验证局部轴映射,不代表 Motive Streaming 静止姿态。"""
     nodes = _skeleton_frame()
-    d = nodes[15] - nodes[0]                     # (0.010, 0.005, 0.090)
-    assert np.allclose(AXIS @ d, [-0.005, 0.010, 0.090], atol=1e-12)
+    d = nodes[15] - nodes[0]                     # (0.010,0.005,0.090)
+    assert np.allclose(AXIS @ d, [0.010, 0.090, -0.005], atol=1e-12)
 
     p_b = np.array([0.30, 1.20, -0.20])
     q_b = np.array([0.0, 0.0, 0.0, 1.0])          # xyzw 恒等
@@ -35,27 +37,30 @@ def test_hand_nodes_to_global_no_back_rotation():
 
     g = hand_nodes_to_global(nodes, 0, p_w, q_w, AXIS)
     assert np.allclose(g[0], p_w, atol=1e-12)              # 手腕节点恒等于手腕位姿
-    assert np.allclose(g[15], [0.445, 0.91, -0.16], atol=1e-9)
+    assert np.allclose(g[15], [0.46, 0.99, -0.255], atol=1e-9)
 
 
-def test_hand_nodes_to_global_with_back_rotation():
-    """情形 B:背部刚体绕 motive z 轴(新系竖轴)转 30°。"""
+def test_streamed_z_up_back_pose_maps_manus_up_to_world_z():
+    """真实链路:Motive native Y-up → Streaming Z-up 已包含在刚体 q 中,A 只做局部轴对齐。"""
     nodes = _skeleton_frame()
+    # C_Motive→Stream = Rx(+90°):native +Y(up) → Streaming +Z(up)。
+    q_stream_from_native = np.array([np.cos(np.pi / 4), np.sin(np.pi / 4), 0.0, 0.0])
+    # 手背刚体在 Motive native 中绕竖直 +Y 转 30°。
     angle = np.deg2rad(30)
-    q_b = np.array([0.0, 0.0, np.sin(angle / 2), np.cos(angle / 2)])  # xyzw,绕 z
+    q_native_from_body = np.array([np.cos(angle / 2), 0.0, np.sin(angle / 2), 0.0])
+    q_world_from_body = quat_mul(q_stream_from_native, q_native_from_body)
+    q_b_xyzw = quat_wxyz_to_xyzw(q_world_from_body)
     p_b = np.array([0.30, 1.20, -0.20])
     offset = WristOffset(mode="body", xyz=(0.15, -0.30, -0.05))
 
-    p_w, q_w = wrist_pose_from_back(p_b, q_b, offset)
-    assert np.allclose(p_w, [0.579904, 1.015192, -0.25], atol=1e-5)
+    p_w, q_w = wrist_pose_from_back(p_b, q_b_xyzw, offset)
     assert np.allclose(p_w, p_b + quat_rotate(q_w, offset.xyz), atol=1e-9)
 
     g = hand_nodes_to_global(nodes, 0, p_w, q_w, AXIS)
     assert np.allclose(g[0], p_w, atol=1e-12)
-    # 物理自洽:指尖相对手腕 = R_w·(A·d)
     d = nodes[15] - nodes[0]
     assert np.allclose(g[15] - g[0], quat_rotate(q_w, AXIS @ d), atol=1e-9)
-    # 手指仍相对世界竖直向上(9cm),欧氏距离保持
+    # Manus +Z 经 A 变成 body +Y;streamed q 再把 body +Y 放到 world +Z。
     assert np.isclose(g[15][2] - g[0][2], 0.09, atol=1e-5)
     assert np.isclose(np.linalg.norm(g[15] - g[0]), np.linalg.norm(AXIS @ d), atol=1e-12)
 
@@ -88,7 +93,7 @@ def test_stitch_hand_returns_xyzw():
     g, p_w, q_xyzw = stitch_hand(nodes, 0, p_b, q_b, offset, AXIS)
     assert np.allclose(g[0], p_w, atol=1e-12)
     assert np.allclose(q_xyzw, [0, 0, 0, 1], atol=1e-12)
-    assert np.allclose(g[15], [0.445, 0.91, -0.16], atol=1e-9)
+    assert np.allclose(g[15], [0.46, 0.99, -0.255], atol=1e-9)
 
 
 def test_hand_nodes_to_global_palm_offset_independent():

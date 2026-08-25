@@ -280,13 +280,13 @@ def test_hub_rigid_body_names_mapping():
     hub = StreamHub("tcp/127.0.0.1:7447")
     hub._on_rigid_body_names(_FakeSample(
         "mocap/rigid_body_names",
-        json.dumps({"names": {"2": "left_wrist", "4": "left_dip", "1": "right_wrist"}})))
-    assert hub.rigid_body_id("left_dip") == 4
-    assert hub.rigid_body_id("right_wrist") == 1
-    assert hub.rigid_body_name(2) == "left_wrist"
+        json.dumps({"names": {"2": "right_back", "4": "hammer", "1": "left_back"}})))
+    assert hub.rigid_body_id("hammer") == 4
+    assert hub.rigid_body_id("left_back") == 1
+    assert hub.rigid_body_name(2) == "right_back"
     assert hub.rigid_body_id("no_such") is None
     # 覆盖更新
     hub._on_rigid_body_names(_FakeSample(
-        "mocap/rigid_body_names", json.dumps({"names": {"5": "left_dip"}})))
-    assert hub.rigid_body_id("left_dip") == 5
-    assert hub.rigid_body_id("left_wrist") is None
+        "mocap/rigid_body_names", json.dumps({"names": {"3": "tianji_wrist"}})))
+    assert hub.rigid_body_id("tianji_wrist") == 3
+    assert hub.rigid_body_id("left_back") is None

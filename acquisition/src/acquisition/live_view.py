@@ -297,8 +297,8 @@ class StitchedScene:
             point_size=0.012, point_shape="circle", precision="float32",
             point_shading="gradient",
         )
-        # 刚体组成 markers(id_kind=asset_member,即 left_wrist/left_dip 等):
-        # 标定完成后默认隐藏,由「left_rigid」开关控制
+        # 刚体组成 markers(id_kind=asset_member,即 left_back/left_dip 等):
+        # 标定完成后默认隐藏,由「back_rigid」开关控制
         self._rigid_marker_pc = self.server.scene.add_point_cloud(
             "/rigid_markers", points=np.zeros((0, 3)),
             colors=np.zeros((0, 3), dtype=np.uint8),
@@ -333,8 +333,8 @@ class StitchedScene:
             self._show_markers_cb = self.server.gui.add_checkbox(
                 "原始标记点", initial_value=True)
             self._btn_rigid = self.server.gui.add_button(
-                "left_rigid", color=(200, 60, 60),
-                hint="点击切换标定刚体(left_wrist/left_dip)markers 显示")
+                "back_rigid", color=(200, 60, 60),
+                hint="点击切换标定刚体(left_back/left_dip)markers 显示")
             self._show_mano_cb = self.server.gui.add_checkbox(
                 "MANO 21 点", initial_value=True)
             self._show_hands_cb = self.server.gui.add_checkbox(
@@ -626,8 +626,8 @@ class StitchedScene:
                 ln.visible = False
 
         # markers 分流:
-        #   普通 markers + 其他刚体(cylinder 等)→ 原始标记点(默认显示)
-        #   标定刚体(left_wrist/left_dip/right_wrist/right_dip)→ left_rigid button 控制
+        #   普通 markers + 其他刚体(hammer/tianji_wrist 等)→ 原始标记点(默认显示)
+        #   标定刚体(left_back/left_dip/right_back/right_dip)→ back_rigid button 控制
         if mocap_frame is not None:
             markers = mocap_frame.get("markers", [])
             calib = calib_rigid_ids or set()

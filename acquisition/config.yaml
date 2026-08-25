@@ -9,7 +9,7 @@ user: shd                           # 操作者:与 manus_pub.sh --user 一致;
 
 # Motive 中定义的刚体(Motive x-forward z-up 右手系、米制)
 # 2026-08-24 更新:Motive 全局坐标系已改为 x 前向(forward)、z 向上(up),
-# 刚体 ID 已重排——id=1 left_wrist、id=2 right_wrist、id=3 tianji_wrist(原 right_arm)、
+# 刚体 ID 已重排——id=1 left_back、id=2 right_back、id=3 tianji_wrist(原 right_arm)、
 # id=4 hammer(旧 cylinder=3 / cube=8 / hammer=9 不再适用)。
 # 如需采集 cylinder/cube,先在 Motive 中建对应刚体再加入 objects。
 rigid_bodies:
@@ -20,32 +20,32 @@ rigid_bodies:
 
 hands:
   left:
-    back_rigid_id: 1               # 物理左手腕(Motive 名 right_wrist,命名错误)
-    wrist_offset:                  # ⚠ 未标定,占位零偏移:链路验证可用,数据不真实
+    back_rigid_id: 1               # Motive left_back:物理左手背刚体
+    wrist_offset:                  # 手背刚体局部系 → 解剖手腕的固定外参
       mode: body                   # body=随刚体旋转(推荐);world=固定世界方向
       xyz:                         # 标定后填:手背刚体 → 手腕的实际偏移
-      - 0.0206
-      - -0.025
-      - -0.0967
-      yaw_deg: -135.19
-      pitch_deg: -70.4
-      roll_deg: 149.43
+      - -0.0769
+      - 0.0067
+      - -0.062
+      yaw_deg: 0.18
+      pitch_deg: -5.16
+      roll_deg: 91.36
   right:
-    back_rigid_id: 2               # 物理右手腕(Motive 名 left_wrist,命名错误)
+    back_rigid_id: 2               # Motive right_back:物理右手背刚体
     wrist_offset:
       mode: body
       xyz:
-      - 0.0378
-      - 0.0235
-      - -0.0923
-      yaw_deg: -118.13
-      pitch_deg: -42.78
-      roll_deg: 97.47
+      - -0.0854
+      - 0.0132
+      - -0.0499
+      yaw_deg: -6.93
+      pitch_deg: 0.24
+      roll_deg: 76.33
   # 若 Motive 直接追踪手腕刚体(无 offset 场景),改用 wrist_rigid_id 即可
 
-axis_transform:                    # Manus 骨架(z-up) → Motive 系(x-forward z-up) 轴变换
-  permutation: [1, 0, 2]           # 输出 = (输入[1], 输入[0], 输入[2])
-  signs: [-1, 1, 1]                # A·d = (-d_y, d_x, d_z) = 绕 Y +90°
+axis_transform:                    # Manus 骨架局部系 → 手腕/手背刚体局部系
+  permutation: [0, 2, 1]           # 输出 = (输入[0], 输入[2], 输入[1])
+  signs: [1, 1, -1]                # A·d = (d_x, d_z, -d_y);局部→局部,不重复做 Streaming 变换
   # 标定:开 live_view 看手指方向;上/下颠倒改 signs,左/右颠倒改 permutation
 
 recording:

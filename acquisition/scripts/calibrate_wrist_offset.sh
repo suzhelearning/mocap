@@ -6,20 +6,21 @@
 #       写入 acquisition/offset/<user>.yaml。
 #
 # 用法:
-#   bash calibrate_wrist_offset.sh left                     # 标定左手(参照 left_dip)
-#   bash calibrate_wrist_offset.sh right --user syz         # 标定右手(用户 syz)
-#   bash calibrate_wrist_offset.sh --side left              # 等价写法
-#   bash calibrate_wrist_offset.sh left --ref-name left_dip --back-name left_wrist
+#   bash calibrate_wrist_offset.sh left --user shd \
+#     --back-name left_back --landmarks config/wrist_landmarks.yaml
+#   bash calibrate_wrist_offset.sh right --user shd \
+#     --back-name right_back --landmarks config/wrist_landmarks.yaml
+#   bash calibrate_wrist_offset.sh left --ref-name left_dip  # 兼容参照刚体模式
 #
 # 可选参数(透传标定脚本):
-#   --user NAME        操作者(与 manus_pub.sh --user 一致,如 syz/yq/shd)
-#                       结果写入 offset/<NAME>.yaml(默认 default)
-#   --ref-name NAME    参照刚体名字(默认 left_dip;从 mocap/rigid_body_names 解析)
+#   --user NAME        结果写入 offset/<NAME>.yaml
+#   --landmarks FILE   五指桌面已知点 YAML;无需参照刚体
+#   --ref-name NAME    单点参照刚体名字(与 --landmarks 二选一)
+#   --ref-rigid-id ID  单点参照刚体 id(与上述选项互斥)
 #   --back-name NAME   手背刚体名字(默认用 config 的 back_rigid_id)
-#   --ref-rigid-id ID  参照刚体 id(与 --ref-name 二选一,优先 --ref-name)
-#   --poses N          姿势数(默认 5)
-#   --hold S           每姿势采集秒数(默认 3)
-#   --node N           参照骨架节点索引(默认 9 = 中指 DIP)
+#   --poses N          单点模式姿势数(默认 5)
+#   --hold S           每次静止采集秒数(默认 3)
+#   --node N           单点模式 Manus 节点(默认 9=中指 DIP)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

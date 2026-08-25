@@ -66,7 +66,7 @@ class Config:
     user: str = "default"                 # 操作者:与 manus --user 一致
 
     def axis_matrix(self) -> np.ndarray:
-        """骨架系 → Motive 系的 3×3 轴变换矩阵。(A·d)_j = signs[j]·d[permutation[j]]"""
+        """Manus 骨架局部系 → 手腕局部系的轴变换。(A·d)_j = signs[j]·d[permutation[j]]"""
         A = np.zeros((3, 3), dtype=float)
         for j in range(3):
             A[j, self.axis_permutation[j]] = self.axis_signs[j]
@@ -170,11 +170,11 @@ def load_config(path: str | Path) -> Config:
             "rigid_bodies.back 未配置,所有 hands 都必须使用 wrist_rigid_id"
         )
 
-    axis = raw.get("axis_transform", {"permutation": [1, 0, 2], "signs": [-1, 1, 1]})
+    axis = raw.get("axis_transform", {"permutation": [0, 2, 1], "signs": [1, 1, -1]})
     if not isinstance(axis, dict):
         raise ConfigError("axis_transform 必须是映射")
-    perm = axis.get("permutation", [1, 0, 2])
-    signs = axis.get("signs", [-1, 1, 1])
+    perm = axis.get("permutation", [0, 2, 1])
+    signs = axis.get("signs", [1, 1, -1])
     if not (isinstance(perm, list) and isinstance(signs, list)
             and sorted(perm) == [0, 1, 2] and len(signs) == 3
             and all(s in (-1, 1) for s in signs)):

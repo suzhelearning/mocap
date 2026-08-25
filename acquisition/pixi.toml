@@ -14,6 +14,7 @@ viz-h5 = "python scripts/viz_hdf5.py"   # 用法: pixi run viz-h5 -- <日期文�
 mano-beta = "python scripts/mano_beta.py"  # 从至多1000帧关键点估计每只手 beta
 object-offset = "python scripts/motive_object_offset.py"  # 原始 H5 -> 真实 OBJ frame 派生 H5
 add-object-offset = "python scripts/add_object_offset.py"  # Motive Visuals GL/GO -> config/object_offsets.yaml
+capture-wrist-landmarks = "python scripts/capture_wrist_landmarks.py"  # 重采左右五指桌面地标
 test = "pytest tests"
 start-router = "bash scripts/start_zenohd.sh"
 

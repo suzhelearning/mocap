@@ -1,0 +1,169 @@
+version: 1
+coordinate_system: x_forward_y_left_z_up
+unit: meter
+captured_at: '2026-08-25T18:22:56+08:00'
+capture_seconds: 3.0
+contact_z_m: 0.0
+hands:
+  left:
+  - name: thumb
+    node: 24
+    xyz:
+    - 0.082662
+    - 0.020867
+    - 0.0
+    marker_raw_id: 409696
+    measured_center_xyz:
+    - 0.082662
+    - 0.020867
+    - 0.008085
+    std_mm:
+    - 0.018
+    - 0.029
+    - 0.012
+    samples: 360
+  - name: index
+    node: 5
+    xyz:
+    - 0.155224
+    - 0.035303
+    - 0.0
+    marker_raw_id: 409697
+    measured_center_xyz:
+    - 0.155224
+    - 0.035303
+    - 0.008776
+    std_mm:
+    - 0.026
+    - 0.049
+    - 0.015
+    samples: 360
+  - name: middle
+    node: 10
+    xyz:
+    - 0.166197
+    - 0.071454
+    - 0.0
+    marker_raw_id: 409698
+    measured_center_xyz:
+    - 0.166197
+    - 0.071454
+    - 0.009035
+    std_mm:
+    - 0.022
+    - 0.039
+    - 0.015
+    samples: 360
+  - name: ring
+    node: 15
+    xyz:
+    - 0.153559
+    - 0.106029
+    - 0.0
+    marker_raw_id: 409700
+    measured_center_xyz:
+    - 0.153559
+    - 0.106029
+    - 0.009275
+    std_mm:
+    - 0.025
+    - 0.045
+    - 0.027
+    samples: 360
+  - name: little
+    node: 20
+    xyz:
+    - 0.123745
+    - 0.129951
+    - 0.0
+    marker_raw_id: 409699
+    measured_center_xyz:
+    - 0.123745
+    - 0.129951
+    - 0.008933
+    std_mm:
+    - 0.046
+    - 0.023
+    - 0.016
+    samples: 360
+  right:
+  - name: thumb
+    node: 24
+    xyz:
+    - 0.09239
+    - -0.029747
+    - 0.0
+    marker_raw_id: 409745
+    measured_center_xyz:
+    - 0.09239
+    - -0.029747
+    - 0.008022
+    std_mm:
+    - 0.023
+    - 0.041
+    - 0.017
+    samples: 360
+  - name: index
+    node: 5
+    xyz:
+    - 0.151084
+    - -0.033765
+    - 0.0
+    marker_raw_id: 409723
+    measured_center_xyz:
+    - 0.151084
+    - -0.033765
+    - 0.008113
+    std_mm:
+    - 0.022
+    - 0.055
+    - 0.011
+    samples: 360
+  - name: middle
+    node: 10
+    xyz:
+    - 0.172143
+    - -0.057089
+    - 0.0
+    marker_raw_id: 409731
+    measured_center_xyz:
+    - 0.172143
+    - -0.057089
+    - 0.008829
+    std_mm:
+    - 0.042
+    - 0.047
+    - 0.025
+    samples: 360
+  - name: ring
+    node: 15
+    xyz:
+    - 0.17503
+    - -0.095001
+    - 0.0
+    marker_raw_id: 409725
+    measured_center_xyz:
+    - 0.17503
+    - -0.095001
+    - 0.009164
+    std_mm:
+    - 0.014
+    - 0.042
+    - 0.009
+    samples: 360
+  - name: little
+    node: 20
+    xyz:
+    - 0.145456
+    - -0.124559
+    - 0.0
+    marker_raw_id: 409724
+    measured_center_xyz:
+    - 0.145456
+    - -0.124559
+    - 0.008846
+    std_mm:
+    - 0.039
+    - 0.079
+    - 0.037
+    samples: 360
